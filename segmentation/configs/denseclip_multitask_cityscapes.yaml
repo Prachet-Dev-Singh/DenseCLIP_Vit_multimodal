@@ -1,0 +1,128 @@
+# configs/denseclip_multitask_cityscapes.yaml
+
+# Inherit the base dataset configuration
+_base_:
+  - ./_base_/datasets/cityscapes_multitask.yaml
+  # Add other base configs if you have them (e.g., default_runtime.py)
+
+# === Model Configuration ===
+MODEL:
+  TYPE: 'DenseCLIPMultiTask' # Use the new multi-task model class
+
+  # --- Shared CLIP Components ---
+  # IMPORTANT: Update this path to your actual RN50.pt location
+  PRETRAINED: '/home/22dcs005/DenseCLIP/segmentation/pretrained/RN50.pt' # Path to CLIP weights
+  BACKBONE:
+    # Copied from original config
+    type: 'CLIPResNet' # Or CLIPResNetWithAttention if that's what RN50.pt matches
+    layers: [3, 4, 6, 3]
+    width: 64
+    # input_resolution: 512 # Input res might be determined by crop_size now
+    output_dim: 1024 # Final *CLIP* embedding dim, NOT dense feature dim
+  TEXT_ENCODER:
+    # Copied from original config
+    type: 'CLIPTextEncoder'
+    context_length: 77 # Should match value below
+    vocab_size: 49408
+    transformer_width: 512
+    transformer_heads: 8
+    transformer_layers: 12
+    embed_dim: 1024 # Target text dim
+
+  # --- Freezing Options ---
+  FREEZE_TEXT: True           # Freeze the text encoder part of CLIP?
+  FREEZE_IMAGE_BACKBONE: False # Freeze the visual backbone part of CLIP?
+
+  # --- Segmentation Specific Components (Copied from original config) ---
+  # These parameters are used *within* DenseCLIPMultiTask to build seg parts
+  context_length: 77
+  context_feature: 'attention'
+  score_concat_index: 3      # Index where score map is concatenated (if used)
+  # text_head: False         # This logic is handled internally now
+  tau: 0.05                  # Temperature for score map scaling (if identity head used)
+  token_embed_dim: 512
+  text_dim: 1024             # Internal dimension consistency check
+
+  NECK: # Optional FPN for segmentation branch
+    type: 'FPN'
+    in_channels: [256, 512, 1024, 2048] # Channels from ResNet stages
+    out_channels: 256
+    num_outs: 4
+
+  DECODE_HEAD: # Segmentation head config
+    type: 'FCNHead' # Ensure FCNHead class is available
+    in_channels: 256 # Input from FPN
+    channels: 256    # Intermediate channels in head
+    num_classes: 19  # Automatically set from len(class_names) in model init usually
+    align_corners: False
+    # dropout_ratio: 0.1 # Dropout often handled differently or omitted in newer frameworks
+
+  # CONTEXT_DECODER: null # Set if you use one (wasn't in original)
+  # IDENTITY_HEAD: null # Set if you use one (wasn't in original)
+  # AUXILIARY_HEAD: null # Set if you use one (wasn't in original)
+
+  # --- NEW: Depth Specific Components ---
+  DEPTH:
+    DECODER_CHANNELS: [512, 256, 128, 64] # Channels for SimpleDepthDecoder layers
+    LOSS_TYPE: 'silog' # Choose 'silog', 'berhu', or 'l1'
+    # --- Parameters specific to the chosen loss ---
+    SILOG_VARIANCE_FOCUS: 0.85 # (Lambda for SILog loss)
+    # BERHU_THRESHOLD: 0.2 # (Threshold factor 'c' for BerHu loss)
+    # --- End Loss specific params ---
+
+  # --- NEW: Multi-Task Loss Weights ---
+  LOSS_WEIGHTS:
+    SEG: 1.0   # Weight for segmentation loss
+    DEPTH: 0.1 # Weight for depth loss (TUNE THIS!)
+
+# === Data Configuration ===
+DATA:
+  # Inherited from base: dataset_type, data_root, class_names, ignore_label, depth params etc.
+  # --- Define parameters needed for transforms/dataloader here ---
+  samples_per_gpu: 4   # <<< ADJUST based on VRAM! Multi-task needs more memory. Was 32.
+  workers_per_gpu: 4   # <<< ADJUST based on CPU cores/IO. Was 32.
+  # Define transform parameters (used by pipeline in training script)
+  crop_size: [512, 1024] # Target size after resize/crop
+  # scale_range: [0.5, 2.0] # For RandomResize (if used in pipeline)
+  norm_mean: [0.48145466, 0.4578275, 0.40821073] # CLIP mean
+  norm_std: [0.26862954, 0.26130258, 0.27577711] # CLIP std
+
+# === Training Configuration ===
+TRAIN:
+  # --- Optimizer ---
+  OPTIMIZER:
+    type: 'AdamW'
+    lr: 0.00006 # Starting LR (might need tuning, slightly increased from original)
+    betas: (0.9, 0.999)
+    weight_decay: 0.01
+    # Optional: parameter-specific LR multipliers (e.g., lower LR for backbone)
+    # paramwise_cfg:
+    #   custom_keys:
+    #     clip_visual:
+    #       lr_mult: 0.1 # Example: 10x lower LR for visual backbone
+    #     clip_text_encoder:
+    #       lr_mult: 0.0 # Example: No LR if FREEZE_TEXT=True
+
+  # --- LR Scheduler (Polynomial Decay) ---
+  LR_SCHEDULER:
+    type: 'PolyLR' # Assumes PolyLR implementation exists
+    # Total iterations - common setting for Cityscapes (~30 epochs w/ B=8 on ~3k imgs)
+    total_iters: 80000 # <<< ADJUST based on your desired training length/epochs
+    power: 0.9      # Polynomial power
+    min_lr: 1.0e-06 # Minimum learning rate
+
+  # --- Runner/Loop Settings ---
+  max_iters: 80000       # Total training iterations (match scheduler)
+  log_interval: 50        # Log loss every N iterations
+  val_interval: 4000      # Run validation every N iterations (e.g., ~2 epochs)
+  checkpoint_interval: 4000 # Save checkpoint every N iterations
+
+# === Evaluation Configuration ===
+EVALUATION:
+  interval: 4000 # How often to evaluate (matches val_interval)
+  metrics: ['mIoU', 'depth'] # Metrics to compute ('depth' triggers depth metrics)
+
+# === Other Settings ===
+SEED: 42
+# IMPORTANT: Update this path to where you want logs/checkpoints saved
+LOG_DIR: '/home/22dcs005/DenseCLIP/segmentation/work_dirs/denseclip_multitask_cs_default'

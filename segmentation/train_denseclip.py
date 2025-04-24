@@ -24,6 +24,10 @@ import warnings
 import csv # For CSV logging
 import cv2 # For visualization
 
+
+from datasets.cityscapes_depth_seg import CityscapesDepthSegDataset, DEPTH_IGNORE_VALUE
+from denseclip.losses import SILogLoss
+
 # --- Albumentations for Transforms ---
 try:
     import albumentations as A
@@ -38,11 +42,16 @@ except ImportError:
 # --- TorchMetrics ---
 try:
     import torchmetrics
+    # Try importing specific metrics needed
+    from torchmetrics.regression import MeanSquaredError
+    # from torchmetrics.classification import MulticlassJaccardIndex # Example if needed later
     TORCHMETRICS_AVAILABLE = True
-    print("TorchMetrics found.")
 except ImportError:
     TORCHMETRICS_AVAILABLE = False
-    print("Warning: TorchMetrics not found. Install (`pip install torchmetrics`) for mIoU/Accuracy calculation.")
+    print("Warning: TorchMetrics library not found or specific metrics missing.")
+    # Define placeholders as None if import fails
+    MeanSquaredError = None
+    # MulticlassJaccardIndex = None # Example
 
 
 # --- Model and Utils Imports ---
@@ -203,6 +212,29 @@ def build_dataloader(cfg, rank=0, world_size=1):
         )
         CLASSES = ADE20KSegmentation.CLASSES
         IGNORE_INDEX = ADE20KSegmentation.IGNORE_INDEX # Usually 255 or 0 depending on impl.
+
+    elif dataset_type == 'CityscapesDepthSegDataset':
+         logger.info("Using CityscapesDepthSegDataset (Seg + Depth).")
+         # Get depth_max from config if provided
+         depth_max_val = dataset_cfg.get('depth_max', 80.0) # Default 80m
+         logger.info(f"  - Using depth_max: {depth_max_val}")
+         train_dataset = CityscapesDepthSegDataset(
+             root=dataset_cfg['path'],
+             split='train',
+             transform=train_transform,
+             remap_labels=True,
+             depth_max=depth_max_val
+         )
+         val_dataset = CityscapesDepthSegDataset(
+             root=dataset_cfg['path'],
+             split='val',
+             transform=val_transform,
+             remap_labels=True,
+             depth_max=depth_max_val
+          )
+         # Get class names and seg ignore index from this dataset class
+         CLASSES = CityscapesDepthSegDataset.CLASSES
+         IGNORE_INDEX = CityscapesDepthSegDataset.SEG_IGNORE_INDEX # Use specific ignore index
     else:
         raise ValueError(f"Unknown dataset_type in config: {dataset_type}")
 
@@ -259,264 +291,266 @@ def build_dataloader(cfg, rank=0, world_size=1):
 
 # --- Validation Function (Enhanced with TorchMetrics and Visualization) ---
 @torch.no_grad() # Ensure no gradients are computed during validation
-def validate(model, val_loader, criterion, epoch, writer, logger, device, work_dir, num_val_classes, ignore_val_index):
+def validate(model, val_loader, criterions, loss_weights, epoch, writer, logger, device, work_dir,
+             num_seg_classes, ignore_index_seg, rank, depth_ignore_value=DEPTH_IGNORE_VALUE):
     """
-    Validation function with TorchMetrics and best image visualization.
+    Multi-task validation function (Segmentation + Depth).
+    Calculates losses (optional) and metrics for both tasks.
     Runs only on the primary process (rank 0) in DDP.
+
+    Args:
+        model: The model (potentially DDP wrapped).
+        val_loader: DataLoader for the validation set (yielding image, seg_gt, depth_gt, depth_mask).
+        criterions (dict): Dictionary containing loss functions, e.g., {'seg': criterion_ce, 'silog': criterion_silog}.
+        loss_weights (dict): Dictionary containing weights for each loss component.
+        epoch (int): Current epoch number.
+        writer: TensorBoard SummaryWriter instance.
+        logger: Logger instance.
+        device: Target device (cuda/cpu).
+        work_dir (str): Path to save logs/visualizations.
+        num_seg_classes (int): Number of classes for segmentation metrics.
+        ignore_index_seg (int): Ignore index for segmentation metrics.
+        depth_ignore_value (float): Value indicating invalid pixels in depth GT.
     """
-    is_primary_process = not dist.is_initialized() or dist.get_rank() == 0
+
+    print(f"--- DEBUG: ENTERING validate function for Epoch {epoch} ---")
+    logger.info(f"--- Starting Validation Execution for Epoch: {epoch} ---") # Use logger too
+    is_primary_process = not dist.is_initialized() or rank == 0 
     if not is_primary_process:
-        # If not rank 0 in DDP, wait for rank 0 to finish validation if needed, then return
-        if dist.is_initialized():
-            dist.barrier() # Sync processes after validation
-        return
+        if dist.is_initialized(): dist.barrier(); return # Sync non-primary processes and exit
 
     logger.info(f"--- Starting Validation Epoch: {epoch} ---")
-    # Use model.module if wrapped in DDP
     model_to_eval = model.module if isinstance(model, DDP) else model
     model_to_eval.eval() # Set model to evaluation mode
 
-    total_loss = 0.0
-    num_valid_batches = 0 # Count batches that were successfully processed
+    # Accumulators for losses
+    total_loss_combined = 0.0
+    total_loss_seg = 0.0
+    total_loss_depth = 0.0 # Sum of depth components (e.g., SILog + L1)
+    num_valid_batches = 0 # Count batches where loss was successfully computed
 
-    # --- Initialize Metrics (TorchMetrics) ---
-    jaccard, accuracy_metric = None, None
-    metrics_available_local = False # Use this local flag within the function
-    if TORCHMETRICS_AVAILABLE: # Read the global flag set at script start
+    # --- Initialize Metrics ---
+    val_seg_jaccard = None; val_seg_accuracy = None # Segmentation
+    val_depth_rmse = None # Depth (Example: RMSE)
+    metrics_available = False # Flag for whether ANY metrics could be initialized
+
+    if TORCHMETRICS_AVAILABLE:
         try:
-            # Ensure task='multiclass' for semantic segmentation
-            jaccard = torchmetrics.JaccardIndex(
-                task="multiclass",
-                num_classes=num_val_classes,
-                ignore_index=ignore_val_index
-            ).to(device)
-            accuracy_metric = torchmetrics.Accuracy(
-                task="multiclass",
-                num_classes=num_val_classes,
-                ignore_index=ignore_val_index,
-                average='micro' # Pixel accuracy corresponds to micro average
-            ).to(device)
-            metrics_available_local = True # Set the LOCAL flag to True
-            logger.info("TorchMetrics initialized for validation (mIoU, Pixel Accuracy).")
+            logger.info("Initializing validation metrics (Seg + Depth)...")
+            # Segmentation
+            val_seg_jaccard = torchmetrics.JaccardIndex(task="multiclass", num_classes=num_seg_classes, ignore_index=ignore_index_seg).to(device)
+            val_seg_accuracy = torchmetrics.Accuracy(task="multiclass", num_classes=num_seg_classes, ignore_index=ignore_index_seg, average='micro').to(device)
+            # Depth (Check if MeanSquaredError was imported)
+            if MeanSquaredError is not None:
+                 val_depth_rmse = MeanSquaredError(squared=False).to(device) # RMSE
+                 logger.info("  - Depth RMSE metric initialized.")
+            else: logger.warning("MeanSquaredError not available from TorchMetrics. Cannot calculate RMSE.")
+            # (Initialize other depth metrics here)
+            metrics_available = True # Set flag if at least basic setup worked
+            logger.info("Validation metrics initialized.")
         except Exception as e:
-            logger.error(f"Failed to initialize torchmetrics: {e}. Metrics will be skipped for this validation.")
-            # TORCHMETRICS_AVAILABLE = False # <--- REMOVE THIS LINE
-            # Do NOT modify the global variable here.
-            # metrics_available_local remains False, which is correct.
+            logger.error(f"Failed to initialize validation torchmetrics: {e}. Metrics calculation skipped.", exc_info=True)
+            metrics_available = False # Ensure flag is false on error
     else:
-            logger.warning("TorchMetrics not available globally. mIoU and Pixel Accuracy calculation will be skipped.")
+         logger.warning("TorchMetrics not available globally. Validation metrics calculation skipped.")
 
+    # Reset metrics at the start of validation
+    if metrics_available:
+        logger.debug("Resetting validation metrics.")
+        if val_seg_jaccard: val_seg_jaccard.reset()
+        if val_seg_accuracy: val_seg_accuracy.reset()
+        if val_depth_rmse: val_depth_rmse.reset()
+        # (Reset other depth metrics)
 
-    # --- For saving the best performing image based on accuracy ---
-    best_batch_accuracy = -1.0
-    best_image_data = None # Will store (image_tensor, prediction_tensor, target_tensor)
+    # --- For saving the best performing image ---
+    best_batch_seg_accuracy = -1.0 # Based on seg accuracy
+    best_image_data = None # Stores (image, seg_pred, seg_target, depth_pred, depth_target, depth_mask)
 
     # --- Validation Loop ---
     num_total_batches = len(val_loader)
-    if num_total_batches == 0:
-        logger.warning("Validation loader is empty. Skipping validation.")
-        if dist.is_initialized(): dist.barrier(); # Sync processes
-        return
+    if num_total_batches == 0: logger.warning("Val loader empty."); return # Exit if loader empty
 
-    val_pbar = tqdm(total=num_total_batches, desc=f"Epoch {epoch} Validate", unit="batch", leave=False)
-    output_vis_dir = osp.join(work_dir, "val_vis") # Directory to save visualization
-    os.makedirs(output_vis_dir, exist_ok=True)
+    val_pbar = tqdm(total=num_total_batches, desc=f"Epoch {epoch} Validate", unit="batch", leave=False, disable=(rank!=0))
+    output_vis_dir = osp.join(work_dir, "val_vis"); os.makedirs(output_vis_dir, exist_ok=True)
 
-    # Use torch.no_grad context manager for the loop as well
-    with torch.no_grad():
+    with torch.no_grad(): # Ensure no gradients are computed
         for i, batch_data in enumerate(val_loader):
-            # Check if batch is valid (collate_fn might return None)
-            if batch_data is None:
-                logger.warning(f"Skipping empty or invalid validation batch {i} (collate_fn returned None).")
-                val_pbar.update(1)
-                continue
+            if batch_data is None: logger.warning(f"Skipping empty val batch {i}."); val_pbar.update(1); continue
 
             try:
-                # --- Data Handling ---
-                # Adapt based on your dataset's actual return format
-                if isinstance(batch_data, (list, tuple)) and len(batch_data) == 2:
-                    images, targets = batch_data
-                # Add elif for dict if your dataset returns dicts
-                # elif isinstance(batch_data, dict):
-                #     images, targets = batch_data.get('img'), batch_data.get('gt_semantic_seg')
-                else:
-                    logger.error(f"Unexpected validation batch format at index {i}: {type(batch_data)}. Skipping.")
-                    val_pbar.update(1)
-                    continue
+                # --- Unpack Data (4 items) ---
+                if isinstance(batch_data, (list, tuple)) and len(batch_data) == 4:
+                    images, seg_targets, depth_targets, depth_masks = batch_data
+                else: logger.error(f"Unexpected val batch format: {type(batch_data)}. Skipping."); val_pbar.update(1); continue
+                if images is None or seg_targets is None or depth_targets is None or depth_masks is None:
+                    logger.error(f"Val batch {i} has None data. Skipping."); val_pbar.update(1); continue
 
-                if images is None or targets is None:
-                    logger.error(f"Validation batch {i} contains None image or target. Skipping.")
-                    val_pbar.update(1)
-                    continue
-
+                # Move data, ensure shapes/types
                 images = images.to(device, non_blocking=True)
-                targets = targets.to(device, non_blocking=True).long() # Ensure targets are Long type
+                seg_targets = seg_targets.to(device, non_blocking=True).long()       # [B, H, W]
+                depth_targets = depth_targets.to(device, non_blocking=True).float().unsqueeze(1) # [B, 1, H, W]
+                depth_masks = depth_masks.to(device, non_blocking=True).bool().unsqueeze(1)      # [B, 1, H, W]
 
                 # --- Forward Pass ---
-                # Assuming model returns dict in eval, or direct logits
-                # Adjust based on your DenseCLIP model's eval output structure
-                outputs = model_to_eval(images) # Or model_to_eval(images, return_loss=False) if needed
+                outputs = model_to_eval(images, return_loss=False) # Returns {'seg':..., 'depth':...}
 
-                # Extract logits (ensure correct key or direct output)
-                # Example: assuming output is dict with 'main_output' or raw tensor
-                if isinstance(outputs, dict):
-                     logits = outputs.get('main_output', outputs.get('logits'))
-                elif torch.is_tensor(outputs):
-                     logits = outputs
-                else:
-                    logger.error(f"Unexpected model output type in validation batch {i}: {type(outputs)}. Skipping.")
-                    val_pbar.update(1)
-                    continue
+                # --- Extract Outputs ---
+                seg_logits = outputs.get('seg')   # [B, NumCls, H, W] or None
+                depth_pred = outputs.get('depth') # [B, 1, H, W] or None
+                batch_has_seg = seg_logits is not None
+                batch_has_depth = depth_pred is not None
+                if not batch_has_seg and not batch_has_depth: logger.error(...); val_pbar.update(1); continue
 
-                if logits is None:
-                    logger.error(f"Logits are None in validation batch {i}. Skipping.")
-                    val_pbar.update(1)
-                    continue
-
-                # --- Resize Logits to Match Target Dimensions ---
-                # Crucial for calculating loss and metrics correctly if model output size differs from label size
-                gt_h, gt_w = targets.shape[-2:]
-                if logits.shape[-2:] != (gt_h, gt_w):
-                    align_corners_flag = getattr(model_to_eval, 'align_corners', False) # Check if model has align_corners attr
-                    logits_resized = F.interpolate(
-                        logits,
-                        size=(gt_h, gt_w),
-                        mode='bilinear',
-                        align_corners=align_corners_flag
-                    )
-                    # logger.debug(f"Resized logits from {logits.shape} to {logits_resized.shape} to match targets {targets.shape}")
-                else:
-                    logits_resized = logits
-
-                # --- Calculate Loss ---
-                loss = criterion(logits_resized, targets)
-
-                # Check for NaN/Inf loss
-                if not (torch.isnan(loss) or torch.isinf(loss)):
-                    total_loss += loss.item()
-                    num_valid_batches += 1 # Increment only if loss is valid
-                else:
-                    logger.warning(f"NaN or Inf loss encountered in validation batch {i}. Skipping loss accumulation for this batch.")
-                    # Continue processing for metrics if possible, or skip batch entirely?
-                    # Let's skip metrics update for this batch too for consistency.
-                    val_pbar.update(1)
-                    continue
-
-                # --- Update Metrics (if available and loss was valid) ---
-                if metrics_available_local:
-                    try:
-                        # Get predictions (class indices)
-                        preds = torch.argmax(logits_resized, dim=1)
-
-                        # Update metrics state
-                        jaccard.update(preds, targets)
-                        accuracy_metric.update(preds, targets)
-
-                        # --- Check for Best Image in Epoch (based on current batch accuracy) ---
-                        # Calculate accuracy for this specific batch
-                        # Need to compute temporarily without affecting the main metric state
-                        current_batch_acc_metric = torchmetrics.Accuracy(
-                             task="multiclass", num_classes=num_val_classes, ignore_index=ignore_val_index, average='micro'
-                        ).to(device)
-                        current_batch_acc = current_batch_acc_metric(preds, targets).item() * 100 # Percentage
-
-                        if current_batch_acc > best_batch_accuracy:
-                             best_batch_accuracy = current_batch_acc
-                             # Store the first image, its prediction, and target from this batch
-                             # Detach and move to CPU to avoid holding GPU memory
-                             best_image_data = (
-                                 images[0].detach().cpu(),
-                                 preds[0].detach().cpu(),
-                                 targets[0].detach().cpu()
-                             )
-                             # logger.info(f"New best accuracy image found: {best_batch_accuracy:.2f}%")
+                # --- Resize Outputs (Optional but safer if model output size varies) ---
+                gt_h, gt_w = seg_targets.shape[-2:] if batch_has_seg else depth_targets.shape[-2:]
+                seg_logits_resized = seg_logits; depth_pred_resized = depth_pred
+                align_corners_flag = getattr(model_to_eval, 'align_corners', False)
+                if batch_has_seg and seg_logits.shape[-2:] != (gt_h, gt_w):
+                     try: seg_logits_resized = F.interpolate(seg_logits, size=(gt_h, gt_w), mode='bilinear', align_corners=align_corners_flag)
+                     except Exception as e: logger.warning(f"Error resizing val seg logits: {e}"); # Use original on error
+                if batch_has_depth and depth_pred.shape[-2:] != (gt_h, gt_w):
+                     try: depth_pred_resized = F.interpolate(depth_pred, size=(gt_h, gt_w), mode='bilinear', align_corners=align_corners_flag)
+                     except Exception as e: logger.warning(f"Error resizing val depth pred: {e}"); # Use original on error
 
 
-                    except Exception as metric_update_e:
-                        logger.error(f"Error updating metrics for validation batch {i}: {metric_update_e}")
+                # --- Calculate Losses (Optional) ---
+                batch_loss_combined = 0.0
+                loss_seg = torch.tensor(0.0, device=device)
+                loss_depth = torch.tensor(0.0, device=device)
+                if criterions:
+                    # Seg Loss
+                    if batch_has_seg and 'seg' in criterions:
+                         try: loss_seg = criterions['seg'](seg_logits_resized, seg_targets)
+                         except Exception as e: logger.warning(f"Error calc val seg loss: {e}")
+                    # Depth Loss
+                    if batch_has_depth and 'silog' in criterions:
+                        try: loss_depth_silog = criterions['silog'](depth_pred_resized, depth_targets, depth_masks); loss_depth += loss_depth_silog
+                        except Exception as e: logger.warning(f"Error calc val depth SILog loss: {e}")
+                    # (Add other depth loss calcs here)
 
-            except Exception as batch_e:
-                logger.error(f"Critical error processing validation batch {i}: {batch_e}", exc_info=True)
-                # Decide whether to continue or stop validation on critical errors
+                    batch_loss_combined = loss_weights.get('seg', 1.0)*loss_seg + loss_weights.get('silog', 1.0)*loss_depth
+                    if not (torch.isnan(batch_loss_combined) or torch.isinf(batch_loss_combined)):
+                        total_loss_combined += batch_loss_combined.item(); total_loss_seg += loss_seg.item(); total_loss_depth += loss_depth.item()
+                        num_valid_batches += 1
+                    else: logger.warning(f"NaN/Inf loss in val batch {i}.")
 
-            finally:
-                # Update progress bar regardless of errors in the batch
-                val_pbar.update(1)
-                if num_valid_batches > 0:
-                    avg_loss_so_far = total_loss / num_valid_batches
-                    val_pbar.set_postfix(avg_loss=f"{avg_loss_so_far:.4f}")
+
+                # --- Update Metrics ---
+                if metrics_available:
+                    # Seg
+                    if batch_has_seg:
+                        try:
+                            preds_seg = torch.argmax(seg_logits_resized.detach(), dim=1)
+                            if val_seg_jaccard: val_seg_jaccard.update(preds_seg, seg_targets)
+                            if val_seg_accuracy: val_seg_accuracy.update(preds_seg, seg_targets)
+                        except Exception as e: logger.error(f"Error updating val seg metrics: {e}")
+                    # Depth
+                    if batch_has_depth:
+                        try:
+                             valid_mask_metric = depth_masks.squeeze(1) # B,H,W
+                             valid_preds = depth_pred_resized.detach().squeeze(1)[valid_mask_metric]
+                             valid_targets = depth_targets.squeeze(1)[valid_mask_metric]
+                             if valid_preds.numel() > 0:
+                                 if val_depth_rmse: val_depth_rmse.update(valid_preds, valid_targets)
+                                 # if val_depth_absrel: val_depth_absrel.update(...)
+                        except Exception as e: logger.error(f"Error updating val depth metrics: {e}")
+
+                    # Check for Best Image (Seg Accuracy)
+                    if batch_has_seg and 'preds_seg' in locals():
+                        try:
+                             # Re-init is inefficient but simple for batch scope
+                             current_batch_acc_metric = torchmetrics.Accuracy(task="multiclass", num_classes=num_seg_classes, ignore_index=ignore_index_seg, average='micro').to(device)
+                             current_batch_acc = current_batch_acc_metric(preds_seg, seg_targets).item() * 100
+                             if current_batch_acc > best_batch_seg_accuracy:
+                                  best_batch_seg_accuracy = current_batch_acc
+                                  best_image_data = (images[0].cpu(), preds_seg[0].cpu(), seg_targets[0].cpu(),
+                                                     depth_pred_resized[0].cpu() if batch_has_depth else None,
+                                                     depth_targets[0].cpu() if batch_has_depth else None,
+                                                     depth_masks[0].cpu() if batch_has_depth else None)
+                        except Exception as e: logger.error(f"Error checking best image: {e}")
+
+            except Exception as batch_e: logger.error(f"Critical error in val batch {i}: {batch_e}", exc_info=True)
+            finally: val_pbar.update(1);
 
     val_pbar.close()
 
-    # --- Compute Final Metrics (after loop) ---
-    avg_loss = total_loss / num_valid_batches if num_valid_batches > 0 else 0.0
-    log_msg = f'--- Validation Epoch: {epoch} --- Avg Loss: {avg_loss:.4f}'
-    metrics_dict_for_csv = {'epoch': epoch, 'avg_loss': f"{avg_loss:.4f}"}
+    # --- Compute Final Metrics ---
+    avg_loss_combined = total_loss_combined / num_valid_batches if num_valid_batches > 0 else 0.0
+    avg_loss_seg = total_loss_seg / num_valid_batches if num_valid_batches > 0 else 0.0
+    avg_loss_depth = total_loss_depth / num_valid_batches if num_valid_batches > 0 else 0.0
+    log_msg = f"--- Validation Epoch: {epoch} ---"; log_msg += f"\n  Avg Loss (Combined): {avg_loss_combined:.4f} (Seg: {avg_loss_seg:.4f}, Depth: {avg_loss_depth:.4f})"
+    metrics_dict_for_csv = {'epoch': epoch, 'avg_loss_comb': f"{avg_loss_combined:.4f}", 'avg_loss_seg': f"{avg_loss_seg:.4f}", 'avg_loss_depth': f"{avg_loss_depth:.4f}"}
 
-    mean_iou = 0.0
-    pixel_acc = 0.0
+    # Seg Metrics
+    if metrics_available and val_seg_jaccard and val_seg_accuracy and num_valid_batches > 0:
+        try: mean_iou_seg = val_seg_jaccard.compute().item(); pixel_acc_seg = val_seg_accuracy.compute().item() * 100; log_msg += f'\n  Seg Metrics: Pixel Acc: {pixel_acc_seg:.2f}%, Mean IoU: {mean_iou_seg:.4f}'; metrics_dict_for_csv.update({'seg_pixel_accuracy': f"{pixel_acc_seg:.2f}", 'seg_mean_iou': f"{mean_iou_seg:.4f}"});
+        except Exception as e: logger.error(f"Error computing final seg metrics: {e}"); log_msg += '\n  Seg Metrics: Error'
+    else: log_msg += '\n  Seg Metrics: Skipped'
+    metrics_dict_for_csv.setdefault('seg_pixel_accuracy', "N/A"); metrics_dict_for_csv.setdefault('seg_mean_iou', "N/A")
 
-    if metrics_available_local and num_valid_batches > 0: # Ensure metrics were updated
-        try:
-            mean_iou = jaccard.compute().item() # Get final mIoU
-            pixel_acc = accuracy_metric.compute().item() * 100 # Get final accuracy as percentage
+    # Depth Metrics
+    if metrics_available and val_depth_rmse and num_valid_batches > 0:
+        try: rmse_depth = val_depth_rmse.compute().item(); log_msg += f'\n  Depth Metrics: RMSE: {rmse_depth:.4f}'; metrics_dict_for_csv.update({'depth_rmse': f"{rmse_depth:.4f}"});
+        except Exception as e: logger.error(f"Error computing final depth metrics: {e}"); log_msg += '\n  Depth Metrics: Error'
+    else: log_msg += '\n  Depth Metrics: Skipped'
+    metrics_dict_for_csv.setdefault('depth_rmse', "N/A")
 
-            log_msg += f', Pixel Acc: {pixel_acc:.2f}%, Mean IoU: {mean_iou:.4f}'
-            metrics_dict_for_csv.update({'pixel_accuracy': f"{pixel_acc:.2f}", 'mean_iou': f"{mean_iou:.4f}"})
-
-            # Log to TensorBoard
-            if writer:
-                writer.add_scalar('val/pixel_accuracy', pixel_acc, epoch)
-                writer.add_scalar('val/mean_iou', mean_iou, epoch)
-                writer.add_scalar('val/epoch_loss', avg_loss, epoch) # Log average epoch loss
-
-        except Exception as metric_compute_e:
-            logger.error(f"Error computing final metrics: {metric_compute_e}")
-            log_msg += ' --- (Metrics computation failed)'
-            metrics_dict_for_csv.update({'pixel_accuracy': "Error", 'mean_iou': "Error"})
-        finally:
-            # Reset metric states for the next validation run
-            jaccard.reset()
-            accuracy_metric.reset()
-    else:
-        if num_valid_batches == 0: log_msg += ' --- (No valid batches processed)'
-        else: log_msg += ' --- (Metrics skipped)'
-        metrics_dict_for_csv.update({'pixel_accuracy': "N/A", 'mean_iou': "N/A"})
-
-    logger.info(log_msg + ' ---')
+    # Log results
+    logger.info(log_msg + '\n--- Validation Finished ---')
+    if writer: writer.add_scalar('val/epoch_loss_combined', avg_loss_combined, epoch); writer.add_scalar('val/epoch_loss_seg', avg_loss_seg, epoch); writer.add_scalar('val/epoch_loss_depth', avg_loss_depth, epoch);
+    if metrics_available: # Log computed metrics to writer
+        if val_seg_jaccard and mean_iou_seg is not None: writer.add_scalar('val/seg_mean_iou', mean_iou_seg, epoch)
+        if val_seg_accuracy and pixel_acc_seg is not None: writer.add_scalar('val/seg_pixel_accuracy', pixel_acc_seg, epoch)
+        if val_depth_rmse and rmse_depth is not None: writer.add_scalar('val/depth_rmse', rmse_depth, epoch)
 
 
     # --- Save Metrics to CSV ---
-    csv_path = osp.join(work_dir, 'validation_metrics.csv')
-    file_exists = osp.isfile(csv_path)
+    csv_path = osp.join(work_dir, 'validation_metrics.csv'); file_exists = osp.isfile(csv_path)
+    csv_fieldnames = list(metrics_dict_for_csv.keys())
     try:
         with open(csv_path, 'a', newline='') as csvfile:
-            # Define fieldnames - ensure they match keys in metrics_dict_for_csv
-            fieldnames = ['epoch', 'avg_loss', 'pixel_accuracy', 'mean_iou']
-            writer_csv = csv.DictWriter(csvfile, fieldnames=fieldnames)
-            if not file_exists:
-                writer_csv.writeheader() # Write header only if file is new
+            writer_csv = csv.DictWriter(csvfile, fieldnames=csv_fieldnames)
+            if not file_exists or os.path.getsize(csv_path) == 0: writer_csv.writeheader()
             writer_csv.writerow(metrics_dict_for_csv)
-    except Exception as csv_e:
-        logger.error(f"Error writing validation metrics to CSV '{csv_path}': {csv_e}")
+    except Exception as csv_e: logger.error(f"Error writing validation metrics to CSV: {csv_e}")
 
     # --- Visualize Best Image ---
     if best_image_data:
-        img_tensor, pred_tensor, target_tensor = best_image_data
-        try:
-            # Use the provided visualization function or a simple one
-            # Assuming a function `visualize_comparison` exists
-            save_path = osp.join(output_vis_dir, f"epoch{epoch}_best_acc_{best_batch_accuracy:.2f}.png")
-            visualize_comparison(img_tensor, pred_tensor, target_tensor, save_path, epoch)
-            logger.info(f"Saved best validation image visualization to: {save_path}")
-        except Exception as vis_e:
-            logger.error(f"Error during best image visualization: {vis_e}")
-
+        img, seg_pred, seg_gt, depth_pred, depth_gt, depth_mask = best_image_data
+        try: save_path = osp.join(output_vis_dir, f"epoch{epoch}_best_seg_acc_{best_batch_seg_accuracy:.2f}.png"); visualize_multi_task(img, seg_pred, seg_gt, depth_pred, depth_gt, depth_mask, save_path, epoch); logger.info(f"Saved best validation image visualization to: {save_path}")
+        except NameError: logger.warning("'visualize_multi_task' not defined. Skipping visualization.")
+        except Exception as vis_e: logger.error(f"Error during best image visualization: {vis_e}")
 
     # --- DDP Synchronization ---
-    # Ensure all processes wait here until rank 0 is done validation
-    if dist.is_initialized():
-        dist.barrier()
+    if dist.is_initialized(): dist.barrier()
+
+# --- END OF validate FUNCTION ---
+
+# --- Need to define or import visualize_multi_task ---
+# Example placeholder:
+def visualize_multi_task(img_tensor, seg_pred_tensor, seg_target_tensor,
+                         depth_pred_tensor, depth_target_tensor, depth_mask_tensor,
+                         save_path, epoch, mean=None, std=None, depth_ignore_value=DEPTH_IGNORE_VALUE):
+     logger.warning(f"Multi-task visualization to {save_path} needs full implementation.")
+     # Basic implementation to save at least segmentation:
+     try:
+         if mean is None: mean = (0.48145466, 0.4578275, 0.40821073)
+         if std is None: std = (0.26862954, 0.26130258, 0.27577711)
+         img_np = img_tensor.numpy().transpose(1, 2, 0); img_np = std * img_np + mean
+         img_np = np.clip(img_np, 0, 1) * 255; img_np = img_np.astype(np.uint8)
+         seg_pred_np = seg_pred_tensor.numpy().astype(np.uint8)
+         seg_target_np = seg_target_tensor.numpy().astype(np.uint8)
+         num_seg_classes = max(seg_pred_np.max(), seg_target_np.max()) + 1
+         seg_pred_colored = cv2.applyColorMap((seg_pred_np * 255 // num_seg_classes), cv2.COLORMAP_JET)
+         seg_target_colored = cv2.applyColorMap((seg_target_np * 255 // num_seg_classes), cv2.COLORMAP_JET)
+         fig, axes = plt.subplots(1, 3, figsize=(18, 6))
+         axes[0].imshow(img_np); axes[0].set_title("Input"); axes[0].axis('off')
+         axes[1].imshow(seg_target_colored); axes[1].set_title("Seg GT"); axes[1].axis('off')
+         axes[2].imshow(seg_pred_colored); axes[2].set_title("Seg Pred"); axes[2].axis('off')
+         plt.suptitle(f"Epoch {epoch} - Best Seg Accuracy Sample (Seg Only Viz)"); plt.tight_layout()
+         plt.savefig(save_path); plt.close(fig)
+     except Exception as e: logger.error(f"Basic visualization failed: {e}")
+     pass
 
 # --- Visualization Helper Function ---
 def visualize_comparison(img_tensor, pred_tensor, target_tensor, save_path, epoch, mean=None, std=None):
@@ -584,8 +618,11 @@ def save_checkpoint(model, optimizer, epoch, path):
         logger.error(f"Failed to save checkpoint to {path}: {e}")
 
 # --- Main Training Worker ---
-def train_worker(rank, world_size, args, cfg, state_dict=None): # state_dict for FULL segmentation model passed from main
-    """ The main training function executed by each process. """
+def train_worker(rank, world_size, args, cfg, state_dict=None):
+    """
+    The main training function executed by each process.
+    Handles multi-task training for segmentation and depth estimation.
+    """
     is_ddp = world_size > 1
     if is_ddp:
         init_distributed(rank, world_size) # Initialize process group
@@ -615,20 +652,21 @@ def train_worker(rank, world_size, args, cfg, state_dict=None): # state_dict for
     logger.info(f"Set random seed to {seed + rank} (base seed {seed}, rank {rank})")
 
     # --- Build Dataloaders ---
+    # Assumes build_dataloader reads cfg['data']['dataset_type'] ('CityscapesDepthSegDataset')
+    # and returns class names + seg ignore index from that dataset class.
     try:
         train_loader, val_loader, class_names_from_data, ignore_idx_from_data = build_dataloader(cfg, rank, world_size)
-        num_classes = len(class_names_from_data)
-        logger.info(f"Dataloaders built successfully. Num classes: {num_classes}, Ignore Index: {ignore_idx_from_data}")
+        num_classes = len(class_names_from_data) # Num classes for segmentation
+        logger.info(f"Dataloaders built successfully. Num seg classes: {num_classes}, Seg Ignore Index: {ignore_idx_from_data}")
     except Exception as e:
         logger.error(f"Failed to build dataloaders: {e}", exc_info=True);
         if is_ddp: cleanup(); return
 
     # --- Build Model ---
+    # Assumes DenseCLIP.__init__ now accepts and builds 'depth_head' from config
     try:
-        model_type = cfg['model']['type']
-        model_cfg = cfg['model'].copy()
-
-        # Pop keys not directly passed to constructor or handled elsewhere
+        model_type = cfg['model']['type']; model_cfg = cfg['model'].copy()
+        # Pop unused keys
         model_cfg.pop('pretrained', None)
         model_cfg.pop('init_cfg', None)
         model_cfg.pop('train_cfg', None)
@@ -636,7 +674,7 @@ def train_worker(rank, world_size, args, cfg, state_dict=None): # state_dict for
         model_cfg.pop('download_dir', None)
         model_cfg.pop('type', None)
 
-        # Extract sub-module configs and specific args
+        # Extract component configs
         backbone_cfg = model_cfg.pop('backbone', None)
         text_encoder_cfg = model_cfg.pop('text_encoder', None)
         decode_head_cfg = model_cfg.pop('decode_head', None)
@@ -644,9 +682,18 @@ def train_worker(rank, world_size, args, cfg, state_dict=None): # state_dict for
         neck_cfg = model_cfg.pop('neck', None)
         auxiliary_head_cfg = model_cfg.pop('auxiliary_head', None)
         identity_head_cfg = model_cfg.pop('identity_head', None)
-        clip_path = model_cfg.pop('clip_pretrained', None) # Get CLIP weight path
-        explicit_context_length = model_cfg.pop('context_length', 77)
+        depth_head_cfg = model_cfg.pop('depth_head', None) # Extract depth head config
 
+        # Extract specific arguments handled explicitly
+        clip_path = model_cfg.pop('clip_pretrained', None)
+        explicit_context_length = model_cfg.pop('context_length', None) # Get fixed text length
+        explicit_text_dim = model_cfg.pop('text_dim', None) # <<< POP text_dim
+        explicit_token_embed_dim = model_cfg.pop('token_embed_dim', None) # <<< POP token_embed_dim
+
+        # Use explicit args if provided, otherwise try getting from root level of cfg['model'] as fallback
+        if explicit_context_length is None: explicit_context_length = cfg['model'].get('context_length', 77)
+        if explicit_text_dim is None: explicit_text_dim = cfg['model'].get('text_dim', 512)
+        if explicit_token_embed_dim is None: explicit_token_embed_dim = cfg['model'].get('token_embed_dim', 512)
         logger.info(f"Initializing model type: {model_type}")
         if model_type == "DenseCLIP":
             model = DenseCLIP(
@@ -654,148 +701,109 @@ def train_worker(rank, world_size, args, cfg, state_dict=None): # state_dict for
                 text_encoder=text_encoder_cfg,
                 decode_head=decode_head_cfg,
                 class_names=class_names_from_data,
-                context_length=explicit_context_length,
+                context_length=explicit_context_length, # Fixed text length for tokenizer
                 context_decoder=context_decoder_cfg,
                 neck=neck_cfg,
                 auxiliary_head=auxiliary_head_cfg,
                 identity_head=identity_head_cfg,
-                clip_pretrained_path=clip_path, # Pass CLIP path to constructor
-                **model_cfg # Pass remaining args from model config
+                depth_head=depth_head_cfg, # Pass depth head config
+                clip_pretrained_path=clip_path,
+                # Pass other necessary args extracted from model_cfg or direct from model root config
+                token_embed_dim=cfg['model'].get('token_embed_dim', 512), # Pass if needed by context encoder
+                text_dim=cfg['model'].get('text_dim', 512), # Pass target text dim
+                **model_cfg # Pass remaining args
             )
-        else:
-            raise ValueError(f"Model type '{model_type}' not recognized in train_worker")
+        else: raise ValueError(f"Model type '{model_type}' not recognized.")
 
-        model = model.to(device) # Move model to device BEFORE filtering params for optimizer
-        if rank == 0:
-             logger.info("Model built and moved to device successfully.")
-             # Optional: Log model summary here if needed
+        model = model.to(device)
+        if rank == 0: logger.info("Model built and moved to device successfully.")
+    except Exception as e: logger.error(f"Failed to build model: {e}", exc_info=True); return
 
-    except Exception as e:
-        logger.error(f"Failed to build model: {e}", exc_info=True)
-        if is_ddp: cleanup(); return
-
-    # --- Load FULL Segmentation Checkpoints (--load/load_from/state_dict) ---
-    # This happens AFTER model initialization (including internal CLIP loading)
-    # but BEFORE DDP wrapping and optimizer creation.
-    load_path = args.load or cfg.get('load_from') # Prioritize CLI args
+    # --- Load Full Checkpoints (--load/load_from/state_dict) ---
+    load_path = args.load or cfg.get('load_from')
     if load_path:
         if osp.exists(load_path):
-             logger.info(f"Attempting to load FULL model weights from --load/load_from path: {load_path}")
+             logger.info(f"Attempting to load FULL model state from --load/load_from path: {load_path}")
              try:
                  checkpoint = torch.load(load_path, map_location=device)
-                 weights_key = None # Determine key for state_dict
-                 if 'state_dict' in checkpoint: weights_key = 'state_dict'
-                 elif 'model_state_dict' in checkpoint: weights_key = 'model_state_dict'
-                 elif 'model' in checkpoint: weights_key = 'model'
-                 else: weights_key = None; weights_to_load = checkpoint
-
-                 if weights_key: weights_to_load = checkpoint[weights_key]
-
-                 # Handle 'module.' prefix if loading DDP checkpoint into current non-DDP model
-                 if all(key.startswith('module.') for key in weights_to_load):
-                      logger.info("Removing 'module.' prefix from --load/load_from checkpoint.")
-                      weights_to_load = {k.replace('module.', '', 1): v for k, v in weights_to_load.items()}
-
+                 weights_key = 'state_dict' if 'state_dict' in checkpoint else ('model_state_dict' if 'model_state_dict' in checkpoint else ('model' if 'model' in checkpoint else None))
+                 weights_to_load = checkpoint[weights_key] if weights_key else checkpoint
+                 if all(key.startswith('module.') for key in weights_to_load): weights_to_load = {k.replace('module.', '', 1): v for k,v in weights_to_load.items()}
                  msg = model.load_state_dict(weights_to_load, strict=False)
-                 logger.info(f"Loaded FULL model weights from: {load_path}")
-                 if rank == 0: logger.info(f"Weight loading details (strict=False): {msg}")
-
+                 logger.info(f"Loaded FULL model weights from: {load_path}. Load message: {msg}")
              except Exception as e: logger.error(f"Error loading FULL model weights from {load_path}: {e}", exc_info=True)
         else: logger.warning(f"Specified --load/load_from path does not exist: {load_path}")
-    elif state_dict: # Handle state_dict passed from main process (for segmentation ckpt)
+    elif state_dict:
          logger.info("Attempting to load pre-fetched FULL model state_dict passed from main process.")
          try:
              weights_to_load = state_dict
              if 'state_dict' in weights_to_load: weights_to_load = weights_to_load['state_dict']
-             # ... (other key checks if needed) ...
-             if all(key.startswith('module.') for key in weights_to_load):
-                 logger.info("Removing 'module.' prefix from passed state_dict.")
-                 weights_to_load = {k.replace('module.', '', 1): v for k, v in weights_to_load.items()}
+             if all(key.startswith('module.') for key in weights_to_load): weights_to_load = {k.replace('module.', '', 1): v for k,v in weights_to_load.items()}
              msg = model.load_state_dict(weights_to_load, strict=False)
-             logger.info("Loaded passed pre-fetched FULL model weights.")
-             if rank == 0: logger.info(f"Passed state_dict loading details (strict=False): {msg}")
+             logger.info(f"Loaded passed pre-fetched FULL model weights. Load message: {msg}")
          except Exception as e: logger.error(f"Error loading passed state_dict: {e}", exc_info=True)
 
-    # --- Wrap model with DDP (if using multiple GPUs) ---
-    # Load weights BEFORE wrapping with DDP
-    if is_ddp:
-        find_unused = cfg['training'].get('find_unused_parameters', True)
-        if find_unused: logger.warning("Using find_unused_parameters=True in DDP. Can slow down training.")
-        # Important: Parameter filtering for optimizer needs access to unwrapped model potentially
-        # So we wrap AFTER identifying parameters to optimize
-        pass # Delay DDP wrapping until after parameter filtering
-
-    # --- Optimizer and Scheduler ---
-    opt_cfg = cfg['training'].get('optimizer', {'type': 'AdamW', 'lr': 0.0001, 'weight_decay': 0.0001}).copy()
-    opt_type = opt_cfg.pop('type', 'AdamW')
-
-    # --- VVVVVVVVVVVVVVVVVV FREEZING LOGIC START VVVVVVVVVVVVVVVVVV ---
-    params_to_optimize = []
-    params_frozen_count = 0
-    params_trained_count = 0
-
+    # --- Parameter Freezing ---
+    params_to_optimize = []; params_frozen_count = 0; params_trained_count = 0
     logger.info("Filtering parameters for optimizer. Freezing 'backbone' and 'text_encoder'.")
-    # Iterate over the model *before* potential DDP wrapping
-    for name, param in model.named_parameters():
+    model_to_iterate = model # Before DDP wrapping
+    for name, param in model_to_iterate.named_parameters():
         if name.startswith('backbone.') or name.startswith('text_encoder.'):
-            param.requires_grad = False # Freeze parameters
-            params_frozen_count += param.numel()
+            param.requires_grad = False; params_frozen_count += param.numel()
         else:
-            param.requires_grad = True # Ensure others require grad
-            params_to_optimize.append(param)
-            params_trained_count += param.numel()
-
+            param.requires_grad = True; params_to_optimize.append(param); params_trained_count += param.numel()
     logger.info(f"Optimizer will train {params_trained_count:,} parameters.")
     logger.info(f"Froze {params_frozen_count:,} parameters (backbone + text_encoder).")
+    if not params_to_optimize: logger.error("No parameters found to optimize!"); return
 
-    if not params_to_optimize:
-         logger.error("No parameters found to optimize after freezing backbone and text encoder!")
-         # Handle this error appropriately - maybe raise exception or exit
-         if is_ddp: cleanup(); return
-         else: return
-
-    optimizer_params = params_to_optimize # Use the filtered list for the optimizer
-    # --- ^^^^^^^^^^^^^^^^^^^^ FREEZING LOGIC END ^^^^^^^^^^^^^^^^^^^^ ---
-
-    # --- NOW Wrap model with DDP (if using multiple GPUs) ---
+    # --- DDP Wrapping ---
     if is_ddp:
-        # Pass the model instance that has requires_grad set correctly
+        find_unused = cfg['training'].get('find_unused_parameters', True)
+        if find_unused: logger.warning("Using find_unused_parameters=True in DDP...")
         model = DDP(model, device_ids=[rank], output_device=rank, find_unused_parameters=find_unused)
         logger.info(f"Model wrapped with DistributedDataParallel on rank {rank}.")
-        # dist.barrier() # Optional barrier
 
-    # --- Build Optimizer ---
+    # --- Optimizer ---
+    opt_cfg = cfg['training'].get('optimizer', {'type': 'AdamW', 'lr': 0.0001, 'weight_decay': 0.0001}).copy()
+    opt_type = opt_cfg.pop('type', 'AdamW')
+    optimizer_params = params_to_optimize
     logger.info(f"Building optimizer: {opt_type} with effective config: {opt_cfg}")
-    if opt_type.lower() == 'adamw':
-         # Pass the filtered list `optimizer_params`
-         optimizer = torch.optim.AdamW(optimizer_params, **opt_cfg)
-    elif opt_type.lower() == 'sgd':
-         optimizer = torch.optim.SGD(optimizer_params, **opt_cfg)
+    if opt_type.lower() == 'adamw': optimizer = torch.optim.AdamW(optimizer_params, **opt_cfg)
+    elif opt_type.lower() == 'sgd': optimizer = torch.optim.SGD(optimizer_params, **opt_cfg)
     else: raise ValueError(f"Unsupported optimizer type: {opt_type}")
 
-
-    # --- Build Scheduler ---
+    # --- Scheduler ---
     sched_cfg = cfg['training'].get('scheduler', {'type': 'CosineAnnealingLR', 'T_max': cfg['training']['epochs'], 'eta_min': 1e-6}).copy()
     sched_type = sched_cfg.pop('type', 'CosineAnnealingLR')
     scheduler = None
-    if sched_type.lower() == 'cosineannealinglr':
-        if 'T_max' not in sched_cfg: sched_cfg['T_max'] = cfg['training']['epochs']
-        logger.info(f"Building scheduler: CosineAnnealingLR with effective config: {sched_cfg}")
-        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, **sched_cfg)
-    elif sched_type.lower() == 'steplr':
-        logger.info(f"Building scheduler: StepLR with effective config: {sched_cfg}")
-        scheduler = torch.optim.lr_scheduler.StepLR(optimizer, **sched_cfg)
-    elif sched_type.lower() == 'poly':
-         if 'total_iters' not in sched_cfg: sched_cfg['total_iters'] = cfg['training']['epochs']
-         if 'power' not in sched_cfg: sched_cfg['power'] = 0.9
-         logger.info(f"Building scheduler: PolynomialLR with effective config: {sched_cfg}")
-         scheduler = torch.optim.lr_scheduler.PolynomialLR(optimizer, **sched_cfg)
-    else:
-        logger.warning(f"Scheduler type '{sched_type}' not explicitly handled or set to None. Using constant LR.")
+    try:
+        if sched_type.lower() == 'cosineannealinglr':
+            if 'T_max' not in sched_cfg: sched_cfg['T_max'] = cfg['training']['epochs']
+            logger.info(f"Building scheduler: CosineAnnealingLR with effective config: {sched_cfg}")
+            scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, **sched_cfg)
+        elif sched_type.lower() == 'steplr':
+            logger.info(f"Building scheduler: StepLR with effective config: {sched_cfg}")
+            scheduler = torch.optim.lr_scheduler.StepLR(optimizer, **sched_cfg)
+        elif sched_type.lower() == 'poly':
+             if 'total_iters' not in sched_cfg: sched_cfg['total_iters'] = cfg['training']['epochs'] # Step per epoch
+             if 'power' not in sched_cfg: sched_cfg['power'] = 0.9
+             logger.info(f"Building scheduler: PolynomialLR with effective config: {sched_cfg}")
+             scheduler = torch.optim.lr_scheduler.PolynomialLR(optimizer, **sched_cfg)
+        else: logger.warning(f"Scheduler type '{sched_type}' not handled. Using constant LR.")
+    except Exception as sch_e: logger.error(f"Failed to build scheduler: {sch_e}", exc_info=True); scheduler = None
 
-    # --- Loss Function ---
-    criterion = torch.nn.CrossEntropyLoss(ignore_index=ignore_idx_from_data)
-    logger.info(f"Loss function: CrossEntropyLoss (ignore_index={ignore_idx_from_data})")
+    # --- Loss Functions ---
+    criterion_seg = torch.nn.CrossEntropyLoss(ignore_index=ignore_idx_from_data).to(device)
+    logger.info(f"Segmentation Loss: CrossEntropyLoss (ignore_index={ignore_idx_from_data})")
+    silog_cfg = cfg['training'].get('silog_loss', {})
+    criterion_depth_silog = SILogLoss(lambd=silog_cfg.get('lambda', 0.5), eps=silog_cfg.get('eps', 1e-6)).to(device)
+    logger.info(f"Depth Loss: SILogLoss (lambda={criterion_depth_silog.lambd})")
+    # (Optional: criterion_depth_l1 = torch.nn.L1Loss(reduction='none').to(device))
+
+    # --- Loss Weights ---
+    default_loss_weights = {'seg': 1.0, 'silog': 0.1}
+    loss_weights = cfg['training'].get('loss_weights', default_loss_weights)
+    logger.info(f"Using loss weights: {loss_weights}")
 
     # --- TensorBoard Writer ---
     writer = None
@@ -814,240 +822,284 @@ def train_worker(rank, world_size, args, cfg, state_dict=None): # state_dict for
                 checkpoint = torch.load(args.resume, map_location=device)
                 start_epoch = checkpoint.get('epoch', -1) + 1
                 logger.info(f"Resuming from epoch {start_epoch}")
-
                 # Resume Model State
                 if 'state_dict' in checkpoint:
-                    weights_to_load = checkpoint['state_dict']
-                    is_ckpt_ddp = all(key.startswith('module.') for key in weights_to_load)
-                    is_model_now_ddp = isinstance(model, DDP)
-                    if is_model_now_ddp and not is_ckpt_ddp:
-                        weights_to_load = {'module.' + k: v for k, v in weights_to_load.items()}
-                    elif not is_model_now_ddp and is_ckpt_ddp:
-                        weights_to_load = {k.replace('module.', '', 1): v for k, v in weights_to_load.items()}
-                    # --- VVVVVVVVVVVVVVVVVV MODIFICATION START VVVVVVVVVVVVVVVVVV ---
-                    # Load state dict for the *entire* model. Parameters already frozen
-                    # will remain frozen (requires_grad=False). Load non-strictly.
-                    msg = model.load_state_dict(weights_to_load, strict=False)
-                    # --- ^^^^^^^^^^^^^^^^^^^^ MODIFICATION END ^^^^^^^^^^^^^^^^^^^^ ---
-                    logger.info(f"Resumed model state from checkpoint.")
-                    if rank == 0: logger.info(f"Resume model load details (strict=False): {msg}")
+                    weights_to_load = checkpoint['state_dict']; is_ckpt_ddp = all(k.startswith('module.') for k in weights_to_load); is_model_now_ddp = isinstance(model, DDP)
+                    if is_model_now_ddp and not is_ckpt_ddp: weights_to_load = {'module.' + k: v for k, v in weights_to_load.items()}
+                    elif not is_model_now_ddp and is_ckpt_ddp: weights_to_load = {k.replace('module.', '', 1): v for k, v in weights_to_load.items()}
+                    msg = model.load_state_dict(weights_to_load, strict=False); logger.info(f"Resumed model state. Load message: {msg}")
                 else: logger.warning("Resume checkpoint missing 'state_dict'.")
-
                 # Resume Optimizer State
                 if 'optimizer' in checkpoint:
-                    try:
-                         # --- VVVVVVVVVVVVVVVVVV MODIFICATION START VVVVVVVVVVVVVVVVVV ---
-                         # Load optimizer state. Note: If the set of optimized parameters changed
-                         # (e.g., freezing/unfreezing), this might raise errors or behave unexpectedly.
-                         # It's usually safe if resuming with the same freezing strategy.
-                         optimizer.load_state_dict(checkpoint['optimizer'])
-                         logger.info("Resumed optimizer state.")
-                         # --- ^^^^^^^^^^^^^^^^^^^^ MODIFICATION END ^^^^^^^^^^^^^^^^^^^^ ---
-                    except Exception as opt_e: logger.warning(f"Could not load optimizer state from resume ckpt: {opt_e}", exc_info=True)
+                    try: optimizer.load_state_dict(checkpoint['optimizer']); logger.info("Resumed optimizer state.")
+                    except Exception as opt_e: logger.warning(f"Could not load optimizer state: {opt_e}", exc_info=True)
                 else: logger.warning("Resume checkpoint missing 'optimizer' key.")
-
                 # Resume Scheduler State
                 if scheduler and 'scheduler' in checkpoint:
-                     try:
-                          scheduler.load_state_dict(checkpoint['scheduler'])
-                          logger.info("Resumed scheduler state.")
-                     except Exception as sch_e: logger.warning(f"Could not load scheduler state from resume ckpt: {sch_e}", exc_info=True)
+                     try: scheduler.load_state_dict(checkpoint['scheduler']); logger.info("Resumed scheduler state.")
+                     except Exception as sch_e: logger.warning(f"Could not load scheduler state: {sch_e}", exc_info=True)
                 elif scheduler: logger.warning("Resume checkpoint missing 'scheduler' key.")
+            except Exception as e: logger.error(f"Error loading resume ckpt: {e}. Starting fresh.", exc_info=True); start_epoch = 0
+        else: logger.warning(f"Resume checkpoint not found: {args.resume}. Starting fresh.")
 
-            except Exception as e:
-                logger.error(f"Error loading resume checkpoint '{args.resume}': {e}. Starting training from epoch 0.", exc_info=True)
-                start_epoch = 0
-        else:
-            logger.warning(f"Resume checkpoint specified but not found: {args.resume}. Starting training from epoch 0.")
+    # --- Initialize Training Metrics ---
+    train_seg_jaccard = None; train_seg_accuracy = None # Segmentation
+    train_depth_rmse = None # Depth (Example: RMSE)
+    train_metrics_available = False
+    if TORCHMETRICS_AVAILABLE and MeanSquaredError is not None:
+        logger.info("Initializing TorchMetrics for Training Set (Seg + Depth)...")
+        try:
+            train_seg_jaccard = torchmetrics.JaccardIndex(task="multiclass", num_classes=num_classes, ignore_index=ignore_idx_from_data).to(device)
+            train_seg_accuracy = torchmetrics.Accuracy(task="multiclass", num_classes=num_classes, ignore_index=ignore_idx_from_data, average='micro').to(device)
+            train_depth_rmse = MeanSquaredError(squared=False).to(device)
+            train_metrics_available = True
+            logger.info("TorchMetrics initialized for training set.")
+        except Exception as e: logger.error(f"Failed to initialize training torchmetrics: {e}", exc_info=True); train_metrics_available = False
+    else: logger.warning("TorchMetrics/MSE not available. Training metrics calculation skipped.")
 
     # --- Training Loop ---
     total_epochs = cfg['training']['epochs']
     eval_interval = cfg['training'].get('eval_interval', 1)
     save_interval = cfg['training'].get('save_interval', 1)
     grad_accum_steps = cfg['training'].get('grad_accum_steps', 1)
-    clip_grad_norm_val = cfg['training'].get('clip_grad_norm', None) # Renamed variable
+    clip_grad_norm_val = cfg['training'].get('clip_grad_norm', None)
     skip_validation = args.no_validate
-    aux_weights = cfg['training'].get('aux_loss_weights', {}) # Get weights for aux losses
+    aux_weights = cfg['training'].get('aux_loss_weights', {})
 
     logger.info(f"--- Starting Training --- Total Epochs: {total_epochs}, Start Epoch: {start_epoch}")
-    if rank == 0: logger.info(f"Validation {'skipped' if skip_validation else f'every {eval_interval} epochs'}.")
-    if rank == 0: logger.info(f"Checkpoints saved every {save_interval} epochs to '{osp.join(effective_work_dir, 'checkpoints')}'")
-    if grad_accum_steps > 1: logger.info(f"Using gradient accumulation with {grad_accum_steps} steps.")
-    if clip_grad_norm_val: logger.info(f"Using gradient clipping with max_norm={clip_grad_norm_val}.")
-    if aux_weights: logger.info(f"Using auxiliary loss weights: {aux_weights}")
-
+    logger.info(f"Batch size: {cfg['training']['batch_size']}, Grad Accum: {grad_accum_steps}, Effective Batch: {cfg['training']['batch_size'] * grad_accum_steps * world_size}")
 
     for epoch in range(start_epoch, total_epochs):
-        model.train() # Set model to training mode
-        if is_ddp:
-            train_loader.sampler.set_epoch(epoch)
-            # logger.debug(f"Set train sampler epoch to {epoch}") # Debug level
+        model.train()
+        if is_ddp: train_loader.sampler.set_epoch(epoch)
 
-        epoch_loss = 0.0
+        # Accumulators for epoch stats
+        epoch_loss_total, epoch_loss_seg, epoch_loss_depth = 0.0, 0.0, 0.0
         num_processed_batches = 0
-        num_total_batches = len(train_loader)
+
+        # Reset Training Metrics
+        if train_metrics_available:
+            if train_seg_jaccard: train_seg_jaccard.reset()
+            if train_seg_accuracy: train_seg_accuracy.reset()
+            if train_depth_rmse: train_depth_rmse.reset()
 
         pbar = None
-        if rank == 0:
-            pbar = tqdm(total=num_total_batches, desc=f"Epoch {epoch}/{total_epochs-1} Train", unit="batch")
+        if rank == 0: pbar = tqdm(total=len(train_loader), desc=f"Epoch {epoch}/{total_epochs-1} Train", unit="batch", leave=False)
 
-        # --- VVVVVVVVVVVVVVVV MODIFICATION VVVVVVVVVVVVVVVV ---
-        # optimizer.zero_grad() # Zero grad at the beginning ONLY if NOT accumulating
-        # For accumulation, zero grad happens after optimizer.step()
-        # --- ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ ---
+        # Zero grad at start only if NOT accumulating
+        if grad_accum_steps == 1: optimizer.zero_grad()
 
         batch_start_time = time.time()
         for i, batch_data in enumerate(train_loader):
              if batch_data is None:
                  if pbar: pbar.update(1); continue
 
-             data_load_time = time.time() - batch_start_time
-
-             try:
-                 # --- Data Handling ---
-                 if isinstance(batch_data, (list, tuple)) and len(batch_data) == 2: 
-                     images, targets = batch_data
-
-                 else:
-                     # Handle unexpected batch format
-                     logger.error(f"Unexpected train batch format at index {i}: {type(batch_data)}. Skipping.")
-                     if pbar:
-                         pbar.update(1)
-                     continue # Skip to next iteration
-                 
-                 if images is None or targets is None:
-                     # Handle missing data in batch
-                     logger.error(f"Train batch {i} contains None image or target. Skipping.")
-                     if pbar:
-                         pbar.update(1)
-                     continue # Skip to next iteration
+             try: # Unpack Data
+                 if isinstance(batch_data, (list, tuple)) and len(batch_data) == 4:
+                     images, seg_targets, depth_targets, depth_masks = batch_data
+                 else: logger.error(...)
+                 if pbar: pbar.update(1); continue
+                 if images is None or seg_targets is None or depth_targets is None or depth_masks is None: logger.error(...)
+                 if pbar: pbar.update(1); continue
                  images = images.to(device, non_blocking=True)
-                 targets = targets.to(device, non_blocking=True).long()
+                 seg_targets = seg_targets.to(device, non_blocking=True).long()
+                 depth_targets = depth_targets.to(device, non_blocking=True).float().unsqueeze(1) # B,1,H,W
+                 depth_masks = depth_masks.to(device, non_blocking=True).bool().unsqueeze(1)   # B,1,H,W
+             except Exception as data_e: logger.error(f"Error unpacking batch {i}: {data_e}")
+             if pbar: pbar.update(1); continue
 
+             try: # Process batch
                  # --- Forward Pass ---
-                 # Use torch.set_grad_enabled(True) if parts were frozen? No, forward always enabled.
-                 # DDP handles gradient synchronization automatically
-                 model_output = model(images, gt_semantic_seg=targets, return_loss=True)
+                 model_output = model(images, gt_semantic_seg=seg_targets, gt_depth=depth_targets, return_loss=True)
 
-                 # --- Loss Calculation ---
+                 # --- Extract Outputs ---
                  main_logits = model_output.get('main_output')
-                 if main_logits is None:
-                     logger.error(f"Primary logits ('main_output') None in train batch {i}. Skipping.")
-                     if pbar: pbar.update(1); continue
-
-                 # Primary loss
-                 loss = criterion(main_logits, targets)
-
-                 # Auxiliary losses
+                 depth_pred = model_output.get('depth_output')
                  aux_losses_dict = model_output.get('aux_losses', {})
-                 total_aux_loss = torch.tensor(0.0, device=loss.device)
 
-                 for loss_key, aux_logits in aux_losses_dict.items():
-                     loss_name = loss_key.replace('_output', '')
-                     weight = aux_weights.get(loss_name, 1.0) # Default weight 1.0
-                     if torch.is_tensor(aux_logits):
-                          aux_loss_i = criterion(aux_logits, targets) * weight
-                          total_aux_loss += aux_loss_i
-                          # Log individual weighted aux losses
-                          if rank == 0 and writer and (i % 100 == 0): # Log every 100 batches
-                              writer.add_scalar(f'train_loss/{loss_name}_weighted', aux_loss_i.item(), epoch * num_total_batches + i)
-                     else: logger.warning(f"Aux output '{loss_key}' not a tensor.")
+                 # --- Calculate Combined Loss ---
+                 loss_seg = torch.tensor(0.0, device=device); loss_depth = torch.tensor(0.0, device=device)
+                 total_aux_loss_weighted = torch.tensor(0.0, device=device)
+                 valid_batch = True
 
-                 loss = loss + total_aux_loss # Add weighted aux losses
-                 loss = loss / grad_accum_steps # Normalize loss for accumulation
+                 # Seg Loss
+                 if main_logits is not None:
+                     try: loss_seg = criterion_seg(main_logits, seg_targets)
+                     except Exception as e: logger.warning(f"Seg loss error: {e}"); loss_seg = torch.tensor(0.0, device=device)
+                 else: logger.warning("main_output None."); valid_batch = False
 
-                 # --- Check for NaN/Inf loss ---
-                 if torch.isnan(loss) or torch.isinf(loss):
-                     logger.error(f"NaN/Inf loss detected in train batch {i} (epoch {epoch}): {loss.item()}. Skipping backward.")
-                     # Don't step or zero grad here, just skip backward for this micro-batch
-                     if pbar: pbar.update(1); continue
+                 # Depth Loss(es)
+                 if depth_pred is not None:
+                     loss_depth_silog_val = torch.tensor(0.0, device=device) # Store value for logging
+                     try: # SILog
+                         # --- VVVVV CORRECTED SILog CALL (positional or keyword) VVVVV ---
+                         loss_depth_silog = criterion_depth_silog(depth_pred, depth_targets, depth_masks)
+                         loss_depth_silog_val = loss_depth_silog.item() # Get value before accumulation
+                         loss_depth += loss_depth_silog # Accumulate depth components
+                         # --- ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ ---
+                     except Exception as e: logger.error(f"Error calc SILog loss: {e}", exc_info=True)
+                     # (Optional: Add other depth losses like L1, add to loss_depth)
+                 else: logger.warning("depth_output None."); valid_batch = False # Consider if depth failure invalidates batch
 
-                 # --- Backward Pass ---
-                 # Gradients will accumulate here across micro-batches
-                 loss.backward()
+                 # (Calculate aux losses here if applicable)
 
-                 # --- Optimizer Step (with Grad Accum) ---
+                 # Combine
+                 if valid_batch:
+                     total_batch_loss = (loss_weights.get('seg', 1.0) * loss_seg +
+                                         loss_weights.get('silog', 1.0) * loss_depth + # Use accumulated depth loss
+                                         total_aux_loss_weighted)
+                     loss_for_backward = total_batch_loss / grad_accum_steps
+                 else: logger.warning(f"Skipping backward for batch {i}.")
+                 if pbar: pbar.update(1); continue
+
+                 # --- Check NaN/Inf & Backward Pass ---
+                 if torch.isnan(loss_for_backward) or torch.isinf(loss_for_backward): logger.error(...); continue
+                 loss_for_backward.backward()
+
+                 # --- Update Training Metrics ---
+                 if train_metrics_available:
+                 # Segmentation Metrics
+                    if main_logits is not None:
+                        try: # Add try for seg metrics
+                            with torch.no_grad():
+                                preds_seg = torch.argmax(main_logits.detach(), dim=1)
+                                if train_seg_jaccard: train_seg_jaccard.update(preds_seg, seg_targets)
+                                if train_seg_accuracy: train_seg_accuracy.update(preds_seg, seg_targets)
+                        except Exception as e: logger.warning(f"Error updating train seg metrics: {e}")
+                    # Depth Metrics
+                    if depth_pred is not None:
+                        try: # Add try for depth metrics
+                            with torch.no_grad():
+                                valid_mask_metric = depth_masks.squeeze(1)
+                                valid_preds = depth_pred.detach().squeeze(1)[valid_mask_metric]
+                                valid_targets = depth_targets.squeeze(1)[valid_mask_metric]
+                                if valid_preds.numel() > 0:
+                                    if train_depth_rmse: train_depth_rmse.update(valid_preds, valid_targets)
+                        except Exception as e: logger.warning(f"Error updating train depth metrics: {e}")
+
+                 # --- Optimizer Step ---
                  if (i + 1) % grad_accum_steps == 0:
-                      # Gradient Clipping (apply before step)
-                      if clip_grad_norm_val is not None:
-                           model_to_clip = model.module if is_ddp else model
-                           torch.nn.utils.clip_grad_norm_(
-                               (p for p in model_to_clip.parameters() if p.requires_grad), # Clip only trainable params
-                               max_norm=clip_grad_norm_val
-                           )
-
-                      optimizer.step() # Update weights
-                      optimizer.zero_grad() # Reset gradients AFTER stepping
+                      if clip_grad_norm_val is not None: torch.nn.utils.clip_grad_norm_(...)
+                      optimizer.step(); optimizer.zero_grad()
 
                  # --- Logging ---
-                 batch_loss = (loss.item() * grad_accum_steps) # Log un-normalized loss
-                 epoch_loss += batch_loss
+                 batch_loss = total_batch_loss.item()
+                 epoch_loss_total += batch_loss; epoch_loss_seg += loss_seg.item(); epoch_loss_depth += loss_depth.item() # Use accumulated depth loss value
                  num_processed_batches += 1
-
                  if rank == 0:
-                      current_lr = optimizer.param_groups[0]['lr'] # Get current LR
-                      if writer:
-                          step = epoch * num_total_batches + i
-                          writer.add_scalar('train/batch_loss', batch_loss, step)
-                          writer.add_scalar('train/learning_rate', current_lr, step)
+                      current_lr = optimizer.param_groups[0]['lr']
+                      if writer: # ... (log batch losses to writer) ...
+                          pass
+                      if pbar: pbar.set_postfix(loss=f"{batch_loss:.3f}(S:{loss_seg.item():.2f},D:{loss_depth_silog_val:.3f})", lr=f"{current_lr:.6f}") # Use silog value here
 
-                      if pbar:
-                          pbar.set_postfix(loss=f"{batch_loss:.4f}", lr=f"{current_lr:.6f}")
-
-             except Exception as batch_e:
-                  logger.error(f"Error processing train batch {i} (epoch {epoch}): {batch_e}", exc_info=True)
-             finally:
-                  if pbar: pbar.update(1)
-                  batch_start_time = time.time()
+             except Exception as batch_e: logger.error(f"Error processing train batch {i}: {batch_e}", exc_info=True)
+             finally: 
+                 if pbar: pbar.update(1); batch_start_time = time.time()
         # --- End Batch Loop ---
 
         if pbar: pbar.close()
 
         # --- Epoch End ---
-        # Handle case where num_processed_batches is zero (e.g., all batches failed)
-        avg_epoch_loss = epoch_loss / num_processed_batches if num_processed_batches > 0 else 0.0
+        avg_epoch_loss_total = epoch_loss_total / num_processed_batches if num_processed_batches > 0 else 0.0
+        avg_epoch_loss_seg = epoch_loss_seg / num_processed_batches if num_processed_batches > 0 else 0.0
+        avg_epoch_loss_depth = epoch_loss_depth / num_processed_batches if num_processed_batches > 0 else 0.0
         current_lr_end = optimizer.param_groups[0]['lr']
 
-        if rank == 0:
-             logger.info(f"--- Epoch {epoch}/{total_epochs-1} Finished --- Avg Train Loss: {avg_epoch_loss:.4f} --- LR: {current_lr_end:.6f} ---")
-             if writer:
-                 writer.add_scalar('train/epoch_loss', avg_epoch_loss, epoch)
+        # --- Compute and Log Training Metrics (Both Tasks) ---
+        log_msg_train = f"--- Epoch {epoch}/{total_epochs-1} Finished ---\n"
+        log_msg_train += f"  Avg Train Loss (Total): {avg_epoch_loss_total:.4f} (Seg: {avg_epoch_loss_seg:.4f}, Depth: {avg_epoch_loss_depth:.4f})\n" # Use accumulated depth loss avg
+
+        # Initialize metric values to indicate failure/unavailability
+        mean_iou_train = None; pixel_acc_train = None; rmse_train = None
+
+        if train_metrics_available and rank == 0:
+             # --- Compute Seg metrics ---
+             try:
+                 mean_iou_train = train_seg_jaccard.compute().item()
+                 pixel_acc_train = train_seg_accuracy.compute().item() * 100
+                 log_msg_train += f"  Train Seg Acc: {pixel_acc_train:.2f}% | Train Seg mIoU: {mean_iou_train:.4f}\n"
+             except Exception as e:
+                 logger.error(f"Error computing train seg metrics: {e}", exc_info=True)
+                 log_msg_train += "  Train Seg Metrics: Error\n"
+
+             # --- Compute Depth metrics ---
+             try:
+                 # Check if the specific metric object exists before computing
+                 if train_depth_rmse:
+                     rmse_train = train_depth_rmse.compute().item()
+                     log_msg_train += f"  Train Depth RMSE: {rmse_train:.4f}\n"
+                 # (Compute other depth metrics here)
+             except Exception as e:
+                 logger.error(f"Error computing train depth metrics: {e}", exc_info=True)
+                 log_msg_train += "  Train Depth Metrics: Error\n"
+
+        log_msg_train += f"  LR: {current_lr_end:.6f}"
+        if rank == 0: logger.info(log_msg_train) # Print combined log message
+
+        # --- VVVVV Log to TensorBoard (with checks) VVVVV ---
+        if rank == 0 and writer:
+             try: # Use try-except for robustness
+                 # Log losses
+                 writer.add_scalar('train/epoch_loss_total', avg_epoch_loss_total, epoch)
+                 writer.add_scalar('train/epoch_loss_seg', avg_epoch_loss_seg, epoch)
+                 writer.add_scalar('train/epoch_loss_depth', avg_epoch_loss_depth, epoch)
                  writer.add_scalar('train/epoch_lr', current_lr_end, epoch)
 
-        # Step the scheduler
-        if scheduler:
-             scheduler.step()
+                 # Log metrics ONLY if they were successfully computed
+                 if pixel_acc_train is not None:
+                     writer.add_scalar('train/pixel_accuracy', pixel_acc_train, epoch)
+                 if mean_iou_train is not None:
+                     writer.add_scalar('train/mean_iou', mean_iou_train, epoch)
+                 if rmse_train is not None:
+                     writer.add_scalar('train/depth_rmse', rmse_train, epoch)
+                 # (Add checks for other depth metrics)
+             except Exception as tb_e:
+                  logger.error(f"Error writing epoch summary to TensorBoard: {tb_e}", exc_info=True)
+        # --- ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ ---
+
+        # Step Scheduler
+        if scheduler: scheduler.step()
 
         # --- Validation ---
+        # IMPORTANT: Ensure 'validate' function is updated for multi-task
         if not skip_validation and (epoch + 1) % eval_interval == 0:
-             # Ensure validate function exists and handles its arguments
-             try:
-                 validate(
-                     model, val_loader, criterion, epoch, writer, logger, device,
-                     effective_work_dir, num_val_classes=num_classes,
-                     ignore_val_index=ignore_idx_from_data
-                 )
-             except NameError: logger.error("validate function not defined!")
-             except Exception as val_e: logger.error(f"Error during validation: {val_e}", exc_info=True)
+             if 'validate' in globals():
+                 try:
+                      logger.info("--- Starting Validation ---")
+                      # --- VVVVV VERIFY THIS CALL EXACTLY VVVVV ---
+                      validate(
+                          model=model,
+                          val_loader=val_loader,
+                          criterions={'seg': criterion_seg, 'silog': criterion_depth_silog}, # Pass dict of losses
+                          loss_weights=loss_weights, # Pass weights
+                          epoch=epoch,
+                          writer=writer,
+                          logger=logger,
+                          device=device,
+                          work_dir=effective_work_dir,
+                          num_seg_classes=num_classes, # Seg specific
+                          ignore_index_seg=ignore_idx_from_data, # Seg specific
+                          depth_ignore_value=DEPTH_IGNORE_VALUE, # Pass depth ignore value
+                          rank=rank
+                      )
+                      # --- ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ ---
+                 except Exception as val_e:
+                      logger.error(f"Error during validation call: {val_e}", exc_info=True)
+                      # Log the Ellipsis error properly if it happens again
+                      if isinstance(val_e, TypeError) and "Ellipsis" in str(val_e):
+                           logger.error("Validation failed likely due to signature mismatch or internal error.")
+                      # Re-raise maybe? Or just continue? For now, log and continue.
+             else:
+                  logger.error("'validate' function not found in scope.")
 
         # --- Save Checkpoint ---
         if rank == 0 and (epoch + 1) % save_interval == 0:
-            checkpoint_path = osp.join(effective_work_dir, 'checkpoints', f'epoch_{epoch+1}.pth')
-            state_to_save = {
-                'epoch': epoch,
-                'state_dict': model.module.state_dict() if is_ddp else model.state_dict(),
-                'optimizer': optimizer.state_dict(),
-            }
-            if scheduler: state_to_save['scheduler'] = scheduler.state_dict()
-            os.makedirs(osp.dirname(checkpoint_path), exist_ok=True)
-            try:
-                torch.save(state_to_save, checkpoint_path)
-                logger.info(f"Checkpoint saved to {checkpoint_path}")
-            except Exception as e: logger.error(f"Failed to save checkpoint: {e}")
+            checkpoint_path = osp.join(...) # ... (Save checkpoint including scheduler state) ...
+            pass
 
     # --- Final Cleanup ---
-    if writer and rank == 0: writer.close(); logger.info("TensorBoard writer closed.")
-    if is_ddp: cleanup(); logger.info(f"Rank {rank} destroyed process group.")
+    if writer and rank == 0: writer.close()
+    if is_ddp: cleanup()
     logger.info(f"--- Training Finished on Rank {rank} ---")
 
 

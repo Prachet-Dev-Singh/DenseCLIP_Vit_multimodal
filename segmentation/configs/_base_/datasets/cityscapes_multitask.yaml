@@ -1,0 +1,42 @@
+# configs/_base_/datasets/cityscapes_multitask.yaml
+
+dataset_type: 'CityscapesDepthDataset' # Use key: value syntax
+# IMPORTANT: Update this path
+data_root: '/home/22dcs005/DenseCLIP_multimodal/segmentation/data/cityscapes'
+
+# Define sub-directory names
+img_dir: 'leftImg8bit'
+ann_dir: 'gtFine'
+disparity_dir: 'disparity'
+
+# --- Depth Conversion Parameters ---
+depth_baseline: 0.22
+depth_focal_length: 2262.52
+DEPTH_MIN: 0.1 # Using keys consistent with main config access
+DEPTH_MAX: 100.0
+# ----------------------------------
+
+ignore_label: 255
+
+# --- Class Names (List format in YAML) ---
+CLASS_NAMES: # Use list indentation
+  - road
+  - sidewalk
+  - building
+  - wall
+  - fence
+  - pole
+  - traffic light
+  - traffic sign
+  - vegetation
+  - terrain
+  - sky
+  - person
+  - rider
+  - car
+  - truck
+  - bus
+  - train
+  - motorcycle
+  - bicycle
+# ---------------------------------------

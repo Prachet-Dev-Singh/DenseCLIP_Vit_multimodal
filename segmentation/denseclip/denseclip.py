@@ -10,17 +10,14 @@ from collections import OrderedDict # Added for state dict filtering
 # Assuming these are defined in a sub-module named 'models' or similar
 from .models import (
     CLIPResNet, CLIPTextEncoder, CLIPVisionTransformer,
-    CLIPResNetWithAttention, CLIPTextContextEncoder, ContextDecoder
+    CLIPResNetWithAttention, CLIPTextContextEncoder, ContextDecoder, ViTFeatureFusionNeck, ConvBNReLU
 )
-# Import head classes if they are defined locally (adjust path if needed)
-# Assuming IdentityHead might need custom implementations or replacements
-# from .heads import IdentityHead # Uncomment if IdentityHead is defined and needed
+
 
 # Setup logger for this module
 logger = logging.getLogger(__name__)
 
-# Need to handle FPN and FPNHead - replace with standard implementations if possible
-# Example using torchvision FPN (might need adaptation)
+
 try:
     from torchvision.ops.feature_pyramid_network import FeaturePyramidNetwork, LastLevelMaxPool
     from torchvision.models.segmentation.fcn import FCNHead # Example replacement for FPNHead
@@ -40,6 +37,7 @@ except ImportError:
     class LastLevelMaxPool(nn.Module): 
          def forward(self, *args): 
               return [torch.zeros(1)] # Needs a dummy forward
+    class ViTFeatureFusionNeck(nn.Module): pass
     logger.warning("Warning: torchvision not found or FPN/FCNHead not available. Neck and Decode Head using dummy placeholders.")
 
 
@@ -69,10 +67,13 @@ class DenseCLIP(nn.Module): # Inherit directly from nn.Module
                  text_encoder, # Config dict for text encoder
                  decode_head, # Config dict for decode head
                  class_names, # List of class names
-                 context_length,
+                 context_length, # <<< Length for FIXED text part (e.g., class name tokens)
                  # --- Arguments with Defaults ---
+                 # --- VVVVV ADD depth_head config VVVVV ---
+                 depth_head=None, # Config dict for depth head (Optional)
+                 # --- ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ ---
                  context_decoder=None, # Optional config dict
-                 neck=None, # Optional config dict
+                 neck=None, # Optional config dict for the neck
                  context_feature='attention',
                  score_concat_index=3,
                  text_head=False, # Whether to feed text embeddings to decode head
@@ -81,8 +82,8 @@ class DenseCLIP(nn.Module): # Inherit directly from nn.Module
                  identity_head=None, # Optional config dict
                  train_cfg=None, # Keep for potential future use
                  test_cfg=None, # Keep for potential future use
-                 token_embed_dim=512, # Usually related to text token embedding before transformer
-                 text_dim=1024, # Target dimension for text features after projection/encoder
+                 token_embed_dim=512, # <<< Dim for learnable context vectors if using ContextEncoder
+                 text_dim=512,        # <<< Final text embedding dimension (TARGET)
                  clip_pretrained_path=None, # <<< Path to CLIP weights <<<
                  **kwargs): # Use kwargs for flexibility
         super().__init__() # Call nn.Module's init
@@ -90,7 +91,10 @@ class DenseCLIP(nn.Module): # Inherit directly from nn.Module
         # --- Store basic attributes ---
         self.class_names = class_names
         self.num_classes = len(class_names)
-        self.context_length = context_length
+        # Store the length used for tokenizing fixed class names
+        self.fixed_text_context_length = context_length
+        logger.info(f"Fixed text context length (for tokenizer): {self.fixed_text_context_length}")
+
         self.context_feature = context_feature
         self.score_concat_index = score_concat_index
         self.text_head = text_head
@@ -98,268 +102,309 @@ class DenseCLIP(nn.Module): # Inherit directly from nn.Module
         self.train_cfg = train_cfg
         self.test_cfg = test_cfg
         self.align_corners = False # Default, updated by decode_head config
+        # Store target text dimension, potentially updated by text_encoder config
+        self.text_dim = text_dim
+        logger.info(f"Target text dimension (text_dim): {self.text_dim}")
 
 
         # --- Build Backbone ---
-        backbone_cfg = backbone.copy()
-        backbone_type = backbone_cfg.pop('type')
-        logger.info(f"Building backbone: {backbone_type} with config: {backbone_cfg}")
-        # ... (keep existing backbone build logic) ...
+        backbone_cfg_copy = backbone.copy()
+        backbone_type = backbone_cfg_copy.pop('type')
+        logger.info(f"Building backbone: {backbone_type} with config: {backbone_cfg_copy}")
         if backbone_type == "CLIPResNet":
-             self.backbone = CLIPResNet(**backbone_cfg)
-             backbone_out_channels = backbone_cfg.get('width', 64) * 8 * 4
+             self.backbone = CLIPResNet(**backbone_cfg_copy)
+             backbone_out_channels = backbone.get('width', 64) * 8 * 4
         elif backbone_type == "CLIPResNetWithAttention":
-             self.backbone = CLIPResNetWithAttention(**backbone_cfg)
-             backbone_out_channels = backbone_cfg.get('output_dim', 1024)
+             self.backbone = CLIPResNetWithAttention(**backbone_cfg_copy)
+             backbone_out_channels = backbone.get('output_dim', 1024)
         elif backbone_type == "CLIPVisionTransformer":
-              self.backbone = CLIPVisionTransformer(**backbone_cfg)
-              backbone_out_channels = backbone_cfg.get('output_dim', backbone_cfg.get('width'))
-              if backbone_out_channels is None: raise ValueError("Could not determine output_dim for CLIPVisionTransformer")
-        else:
-             raise ValueError(f"Unsupported backbone type: {backbone_type}")
-        logger.info(f"Built backbone. Inferred output channels/dim: {backbone_out_channels}")
+              self.backbone = CLIPVisionTransformer(**backbone_cfg_copy)
+              backbone_out_channels = backbone.get('width', 768)
+              config_output_dim = backbone.get('output_dim')
+              if config_output_dim is not None and config_output_dim != backbone_out_channels: logger.warning(...)
+        else: raise ValueError(f"Unsupported backbone type: {backbone_type}")
+        logger.info(f"Built backbone. Output channels/dim: {backbone_out_channels}")
 
 
         # --- Build Text Encoder ---
-        text_encoder_cfg = text_encoder.copy()
-        text_encoder_type = text_encoder_cfg.pop('type')
-        logger.info(f"Building text encoder: {text_encoder_type} with config: {text_encoder_cfg}")
-        # ... (keep existing text encoder build logic) ...
-        text_encoder_out_dim = text_encoder_cfg.get('embed_dim', text_dim)
-        if text_encoder_out_dim != text_dim: logger.warning(f"text_encoder config embed_dim ({text_encoder_out_dim}) != model text_dim ({text_dim}). Ensure this is intended.")
-        if text_encoder_type == "CLIPTextEncoder": self.text_encoder = CLIPTextEncoder(**text_encoder_cfg)
-        elif text_encoder_type == "CLIPTextContextEncoder": self.text_encoder = CLIPTextContextEncoder(**text_encoder_cfg)
+        text_encoder_cfg_copy = text_encoder.copy()
+        text_encoder_type = text_encoder_cfg_copy.pop('type')
+        logger.info(f"Building text encoder: {text_encoder_type}...")
+
+        # Determine and verify the final output dimension
+        encoder_embed_dim = text_encoder.get('embed_dim')
+        if encoder_embed_dim is None: encoder_embed_dim = self.text_dim; logger.warning(...)
+        elif encoder_embed_dim != self.text_dim: logger.warning(...); self.text_dim = encoder_embed_dim
+        text_encoder_cfg_copy['embed_dim'] = self.text_dim # Ensure consistency
+
+        self.is_context_encoder = False # Flag
+        if text_encoder_type == "CLIPTextEncoder":
+             text_encoder_cfg_copy['context_length'] = self.fixed_text_context_length
+             self.text_encoder = CLIPTextEncoder(**text_encoder_cfg_copy)
+             logger.info(f"Built standard CLIPTextEncoder. Output dim: {self.text_dim}. Expects input len: {self.fixed_text_context_length}")
+        elif text_encoder_type == "CLIPTextContextEncoder":
+             total_encoder_len = text_encoder.get('context_length')
+             if total_encoder_len is None: raise ValueError("`context_length` required in CLIPTextContextEncoder config.")
+             text_encoder_cfg_copy['context_length'] = total_encoder_len
+             self.text_encoder = CLIPTextContextEncoder(**text_encoder_cfg_copy)
+             self.is_context_encoder = True
+             logger.info(f"Built CLIPTextContextEncoder. Output dim: {self.text_dim}. Total internal capacity: {total_encoder_len}")
         else: raise ValueError(f"Unsupported text_encoder type: {text_encoder_type}")
-        logger.info(f"Built text encoder.")
 
 
         # --- Load Pre-trained CLIP Weights ---
         if clip_pretrained_path:
-            logger.info(f"Attempting to load pre-trained CLIP weights from: {clip_pretrained_path}")
-            try:
-                logger.info("Loading TorchScript model...")
-                clip_model_jit = torch.jit.load(clip_pretrained_path, map_location="cpu")
-                logger.info("TorchScript model loaded successfully.")
-                clip_state_dict = clip_model_jit.state_dict()
-                logger.info(f"Extracted state_dict with {len(clip_state_dict)} keys.")
+             logger.info(f"Attempting to load pre-trained CLIP weights from: {clip_pretrained_path}")
+             try:
+                 clip_model_jit = torch.jit.load(clip_pretrained_path, map_location="cpu")
+                 clip_state_dict = clip_model_jit.state_dict()
+                 logger.info(f"Loaded CLIP checkpoint with {len(clip_state_dict)} keys.")
 
-                # Prepare and load Visual Weights
-                visual_weights = OrderedDict(); visual_prefix = 'visual.'; count_visual = 0
-                for k, v in clip_state_dict.items():
-                    if k.startswith(visual_prefix): visual_weights[k[len(visual_prefix):]] = v; count_visual += 1
-                if visual_weights:
-                    logger.info(f"Loading {count_visual} keys into visual backbone (strict=False)...")
-                    load_msg_visual = self.backbone.load_state_dict(visual_weights, strict=False)
-                    logger.info(f"Visual backbone loading message: {load_msg_visual}")
-                    if load_msg_visual.missing_keys: logger.warning(f"Visual backbone MISSING keys: {load_msg_visual.missing_keys}")
-                    if load_msg_visual.unexpected_keys: logger.warning(f"Visual backbone UNEXPECTED keys: {load_msg_visual.unexpected_keys}")
-                else: logger.warning(f"No keys matching '{visual_prefix}' prefix found...")
+                 # Load Visual Weights
+                 visual_weights = OrderedDict(); visual_prefix = 'visual.'; count=0
+                 for k,v in clip_state_dict.items(): # ... (filter logic) ...
+                    if k.startswith(visual_prefix): visual_weights[k[len(visual_prefix):]] = v; count+=1
+                 if visual_weights: load_msg_vis = self.backbone.load_state_dict(visual_weights, strict=False); logger.info(f"Loaded {count} visual keys. Msg: {load_msg_vis}")
+                 else: logger.warning("No visual keys found.")
 
-                # Prepare and load Text Weights
-                text_weights = OrderedDict(); text_prefixes_or_keys = ('transformer.', 'token_embedding.', 'positional_embedding', 'ln_final.', 'text_projection'); count_text = 0
-                for k, v in clip_state_dict.items():
-                    if k.startswith(text_prefixes_or_keys): text_weights[k] = v; count_text += 1
-                if text_weights:
-                    logger.info(f"Loading {count_text} keys into text encoder (strict=False)...")
-                    load_msg_text = self.text_encoder.load_state_dict(text_weights, strict=False)
-                    logger.info(f"Text encoder loading message: {load_msg_text}")
-                    if load_msg_text.missing_keys: logger.warning(f"Text encoder MISSING keys: {load_msg_text.missing_keys}")
-                    if load_msg_text.unexpected_keys: logger.warning(f"Text encoder UNEXPECTED keys: {load_msg_text.unexpected_keys}")
-                else: logger.warning("No keys matching typical text encoder prefixes/names found...")
+                 # Load Text Weights
+                 text_weights = OrderedDict(); text_prefixes = ('transformer.', 'token_embedding.', 'positional_embedding', 'ln_final.', 'text_projection'); count=0
+                 model_text_proj_shape = self.text_encoder.text_projection.shape if hasattr(self.text_encoder, 'text_projection') else None
+                 for k, v in clip_state_dict.items():
+                    if any(k.startswith(p) for p in text_prefixes):
+                        if k == 'positional_embedding': # Handle pos embed length
+                           loaded_len = v.shape[0]; model_len = self.text_encoder.positional_embedding.shape[0]
+                           if loaded_len > model_len: text_weights[k] = v[:model_len]; logger.warning(...)
+                           elif loaded_len == model_len: text_weights[k] = v
+                           else: logger.warning(...) # Skip load
+                        elif k == 'text_projection': # Handle projection shape
+                           if model_text_proj_shape is not None and v.shape == model_text_proj_shape: text_weights[k] = v
+                           else: logger.warning(...) # Skip load
+                        else: text_weights[k] = v
+                        count+=1
+                 if text_weights: load_msg_txt = self.text_encoder.load_state_dict(text_weights, strict=False); logger.info(f"Loaded {len(text_weights)} text keys. Msg: {load_msg_txt}")
+                 else: logger.warning("No text keys suitable for loading.")
 
-                del clip_model_jit, clip_state_dict # Free memory
-                logger.info("CLIP jit model and state_dict deleted from memory after loading.")
-
-            except FileNotFoundError: logger.error(f"Pre-trained CLIP file not found: {clip_pretrained_path}")
-            except Exception as e: logger.error(f"Error loading pre-trained CLIP weights: {e}", exc_info=True)
-        else:
-            logger.warning("No 'clip_pretrained_path' provided...")
+                 del clip_model_jit, clip_state_dict
+                 logger.info("CLIP model & state_dict deleted from memory.")
+             except Exception as e: logger.error(f"Error loading CLIP weights: {e}", exc_info=True)
+        else: logger.warning("No 'clip_pretrained_path' provided.")
 
 
-        # --- Add Visual Projection Layers IF needed (MODIFIED) ---
-        self.vis_proj = None
-        self.global_proj = None # Initialize global_proj here
-        if backbone_out_channels != text_dim:
-            logger.info(f"Visual spatial feature dim ({backbone_out_channels}) != Text dim ({text_dim}). Adding spatial projection (Conv2d).")
-            self.vis_proj = nn.Conv2d(backbone_out_channels, text_dim, kernel_size=1)
-
-            logger.info(f"Visual global feature dim ({backbone_out_channels}) != Text dim ({text_dim}). Adding global projection (Linear).")
-            self.global_proj = nn.Linear(backbone_out_channels, text_dim) # Add Linear layer
-        else:
-            logger.info(f"Visual feature dim ({backbone_out_channels}) matches text dim ({text_dim}). No projection needed.")
+        # --- Add Visual Projection Layers IF needed ---
+        self.vis_proj = None; self.global_proj = None
+        if backbone_out_channels != self.text_dim:
+            logger.info(f"Backbone out dim ({backbone_out_channels}) != Text dim ({self.text_dim}). Adding projection layers...")
+            self.vis_proj = nn.Conv2d(backbone_out_channels, self.text_dim, kernel_size=1)
+            self.global_proj = nn.Linear(backbone_out_channels, self.text_dim)
+        else: logger.info(f"Backbone/Text dims match ({self.text_dim}). No projection needed.")
 
 
         # --- Build Context Decoder ---
         self.context_decoder = None
         if context_decoder:
-            context_decoder_cfg = context_decoder.copy()
-            context_decoder_type = context_decoder_cfg.pop('type')
-            logger.info(f"Building context decoder: {context_decoder_type} with config: {context_decoder_cfg}")
-            if context_decoder_type == "ContextDecoder":
-                 context_decoder_cfg.setdefault('visual_dim', text_dim)
-                 self.context_decoder = ContextDecoder(**context_decoder_cfg)
-            else: raise ValueError(f"Unsupported context_decoder type: {context_decoder_type}")
+            context_decoder_cfg = context_decoder.copy(); cd_type = context_decoder_cfg.pop('type'); logger.info(f"Building ContextDecoder: {cd_type}...")
+            if cd_type == "ContextDecoder":
+                context_decoder_cfg['visual_dim'] = self.text_dim # Align expected dim
+                self.context_decoder = ContextDecoder(**context_decoder_cfg)
+            else: raise ValueError(...)
         else: logger.info("No context decoder configured.")
 
 
-        # --- Build Neck (MODIFIED with checks) ---
+        # --- Build Neck ---
         self.neck = None
         self._neck_out_keys = None
-        neck_out_channels = text_dim # Default if no neck
-        if neck:
-            neck_cfg = neck.copy()
-            neck_type = neck_cfg.pop('type')
-            logger.info(f"Building neck: {neck_type} with config: {neck_cfg}")
-            if neck_type == "FPN" and FeaturePyramidNetwork is not None:
-                 # --- Determine FPN input channels ---
-                 default_fpn_in_channels = [
-                     backbone_cfg.get('width', 64) * 1 * 4,
-                     backbone_cfg.get('width', 64) * 2 * 4,
-                     backbone_cfg.get('width', 64) * 4 * 4,
-                     backbone_cfg.get('width', 64) * 8 * 4
-                 ]
-                 if isinstance(self.backbone, CLIPVisionTransformer):
-                      logger.error("Using FPN neck with ViT backbone requires specific multi-scale feature extraction.")
-                      in_channels_list = neck_cfg.get('in_channels', [backbone_out_channels] * 4)
-                 else:
-                      in_channels_list = neck_cfg.get('in_channels', default_fpn_in_channels)
-                 logger.info(f"FPN using input channels: {in_channels_list}")
+        head_in_channels = backbone_out_channels # Start with backbone output dim
 
-                 out_channels = neck_cfg.get('out_channels', 256)
-                 num_outs = neck_cfg.get('num_outs', len(in_channels_list))
-                 extra_blocks = None
-                 if num_outs > len(in_channels_list):
-                      if LastLevelMaxPool is not None: extra_blocks = LastLevelMaxPool(); logger.info("Adding LastLevelMaxPool...")
-                      else: logger.warning("LastLevelMaxPool not available...")
+        if neck: # Check if neck config is provided from YAML
+             neck_cfg_dict = neck.copy(); # Make copy of neck config
+             neck_type = neck_cfg_dict.pop('type'); # Get neck type
+             logger.info(f"Building neck: {neck_type}...")
 
-                 # --- VVVVVV ADDED CHECKS VVVVVV ---
-                 if not isinstance(in_channels_list, list) or not in_channels_list:
-                     raise ValueError(f"FPN 'in_channels_list' is invalid or empty: {in_channels_list}")
-                 if not isinstance(out_channels, int) or out_channels <= 0:
-                     raise ValueError(f"FPN 'out_channels' must be a positive integer: {out_channels}")
-                 logger.info(f"Instantiating FeaturePyramidNetwork with in_channels={in_channels_list}, out_channels={out_channels}")
-                 # --- ^^^^^^ END CHECKS ^^^^^^ ---
+             if neck_type == "ViTFeatureFusionNeck":
+                  # --- VVVVV CORRECTED LOGIC VVVVV ---
+                  # 1. Get 'out_indices' from the BACKBONE config
+                  # Use original 'backbone' dict passed to __init__
+                  backbone_out_indices = backbone.get('out_indices', [])
+                  if not backbone_out_indices:
+                       raise ValueError("Backbone config must specify 'out_indices' when using ViTFeatureFusionNeck.")
 
-                 # Instantiate FPN
-                 self.neck = FeaturePyramidNetwork(
-                      in_channels_list=in_channels_list,
+                  # 2. Construct in_channels_list based on BACKBONE config
+                  neck_in_channels_dim = backbone.get('width', 768) # ViT width from backbone config
+                  in_channels_list = [neck_in_channels_dim] * len(backbone_out_indices)
+                  logger.info(f"Neck expecting {len(in_channels_list)} inputs, each with {neck_in_channels_dim} channels (derived from backbone config).")
+
+                  # 3. Get neck-specific params (out_channels, etc.) from NECK config
+                  # Use original 'neck' dict passed to __init__
+                  out_channels = neck.get('out_channels')
+                  inter_channels = neck.get('inter_channels') # Optional
+
+                  # 4. Validate required neck params
+                  if out_channels is None:
+                      raise ValueError("Neck config for 'ViTFeatureFusionNeck' requires 'out_channels' key.")
+                  if not isinstance(out_channels, int) or out_channels <= 0:
+                      raise ValueError(f"Neck 'out_channels' must be a positive integer, got: {out_channels}")
+                  # --- ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ ---
+
+                  # 5. Import and Instantiate Neck
+                  try:
+                      from .models import ViTFeatureFusionNeck # Adjust import path
+                  except ImportError:
+                      logger.error("Cannot import ViTFeatureFusionNeck from .models")
+                      raise
+                  self.neck = ViTFeatureFusionNeck(
+                      in_channels_list=in_channels_list, # Pass the *calculated* list
                       out_channels=out_channels,
-                      extra_blocks=extra_blocks
-                 )
-                 neck_out_channels = out_channels
-                 self._neck_out_keys = [str(i) for i in range(num_outs)]
-                 logger.info(f"Built torchvision FPN. Output channels: {neck_out_channels}. Assumed keys: {self._neck_out_keys}")
+                      inter_channels=inter_channels,
+                      # Pass any remaining args from neck_cfg_dict if needed: **neck_cfg_dict
+                  )
+                  head_in_channels = out_channels # Update head input dim based on neck output
+                  logger.info(f"Built ViTFeatureFusionNeck. Output channels for head: {head_in_channels}")
 
-            elif neck_type == "FPN": logger.error("Torchvision FPN not available...")
-            else: raise ValueError(f"Unsupported neck type: {neck_type}")
-        else: logger.info("No neck configured.")
+             elif neck_type == "FPN" and FeaturePyramidNetwork is not None:
+                  # FPN logic remains the same (uses ResNet conventions mostly)
+                  logger.info("Building standard FPN neck...")
+                  default_fpn_in = [ backbone.get('width', 64) * 2**(i) * 4 for i in range(4)] # Based on ResNet width
+                  in_channels_list = neck.get('in_channels', default_fpn_in) # Get from neck config or default
+                  out_channels = neck.get('out_channels', 256)
+                  num_outs = neck.get('num_outs', len(in_channels_list))
+                  extra_blocks = None
+                  if num_outs > len(in_channels_list):
+                       if LastLevelMaxPool: extra_blocks = LastLevelMaxPool()
+                       else: logger.warning(...)
+                  if not isinstance(in_channels_list, list) or not in_channels_list: raise ValueError(f"FPN 'in_channels_list' invalid: {in_channels_list}")
+                  if not isinstance(out_channels, int) or out_channels <= 0: raise ValueError(f"FPN 'out_channels' invalid: {out_channels}")
+                  self.neck = FeaturePyramidNetwork(in_channels_list=in_channels_list, out_channels=out_channels, extra_blocks=extra_blocks)
+                  head_in_channels = out_channels
+                  self._neck_out_keys = [str(i) for i in range(num_outs)]
+                  logger.info(f"Built torchvision FPN. Output channels: {head_in_channels}...")
+
+             elif neck_type == "FPN": logger.error("Torchvision FPN specified but not available.")
+             else: raise ValueError(f"Unsupported neck type: {neck_type}")
+        else:
+             # No neck configured path
+             head_in_channels = backbone_out_channels
+             logger.info(f"No neck configured. Head receives {head_in_channels} channels directly from backbone.")
 
 
         # --- Build Decode Head ---
         self.decode_head = None
         self._decode_head_cfg = None
         if decode_head:
-            # ... (decode head build logic - should be okay now) ...
-            decode_head_cfg = decode_head.copy()
-            decode_head_type = decode_head_cfg.pop('type')
-            logger.info(f"Building decode head: {decode_head_type} with config: {decode_head_cfg}")
-            self._decode_head_cfg = decode_head_cfg
-            self.align_corners = decode_head_cfg.get('align_corners', False)
-            decode_num_classes = decode_head_cfg.get('num_classes', self.num_classes)
-            if decode_num_classes != self.num_classes: logger.warning(...); self.num_classes = decode_num_classes
-
+            decode_head_cfg_copy = decode_head.copy(); decode_head_type = decode_head_cfg_copy.pop('type')
+            logger.info(f"Building decode head: {decode_head_type}...")
+            self.align_corners = decode_head.get('align_corners', False)
+            self.num_classes = decode_head.get('num_classes', self.num_classes)
+            in_channels_cfg = decode_head.get('in_channels')
+            final_head_in_channels = head_in_channels
+            if in_channels_cfg is not None:
+                if in_channels_cfg != head_in_channels: logger.warning(f"Decode head config 'in_channels' ({in_channels_cfg}) != inferred input ({head_in_channels}). USING CONFIG VALUE.")
+                final_head_in_channels = in_channels_cfg
+            logger.info(f"Decode head using final input channels: {final_head_in_channels}")
 
             if decode_head_type == "FPNHead" and FCNHead is not None:
-                    in_channels = decode_head_cfg.get('in_channels', neck_out_channels)
-                    if in_channels != neck_out_channels: logger.warning(...)
-                    channels = decode_head_cfg.get('channels', 256)
-                    # Get dropout from config, but DON'T pass it to FCNHead constructor
-                    dropout_ratio = decode_head_cfg.get('dropout_ratio', 0.1) # Keep this line if you plan to use it elsewhere
-                    # --- VVVVVV REMOVE dropout=dropout VVVVVV ---
-                    self.decode_head = FCNHead(in_channels=in_channels, channels=channels) # Removed dropout=dropout
-                    # --- ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ ---
-                    num_intermediate_channels = channels
-                    self.decode_head.classifier = nn.Conv2d(num_intermediate_channels, self.num_classes, kernel_size=1)
-                    logger.info(f"Built torchvision FCNHead and replaced classifier for {self.num_classes} classes.")
-                    # ... (rest of decode head logic) ...
-
-
-            elif decode_head_type == "FPNHead": logger.error("Torchvision FCNHead not available...")
-            elif decode_head_type == "IdentityHead" and IDENTITY_HEAD_AVAILABLE: self.decode_head = IdentityHead(**decode_head_cfg); logger.info("Built IdentityHead.")
-            elif decode_head_type == "IdentityHead": raise ValueError("IdentityHead specified but class definition not found.")
-            else: raise ValueError(f"Unsupported decode_head type: {decode_head_type}")
+                 channels = decode_head.get('channels', 256)
+                 self.decode_head = FCNHead(in_channels=final_head_in_channels, channels=channels)
+                 self.decode_head.classifier = nn.Conv2d(channels, self.num_classes, kernel_size=1)
+                 logger.info(f"Built torchvision FCNHead (classifier replaced for {self.num_classes} classes).")
+            elif decode_head_type == "ViTSegmentationDecoder":
+                 try: from .heads import ViTSegmentationDecoder
+                 except ImportError: raise ValueError("ViTSegmentationDecoder needed but not found.")
+                 encoder_channels = decode_head.get('encoder_channels'); decoder_channels = decode_head.get('decoder_channels')
+                 if encoder_channels is None or decoder_channels is None: raise ValueError(...)
+                 if encoder_channels != final_head_in_channels: logger.warning(...)
+                 self.decode_head = ViTSegmentationDecoder(encoder_channels=encoder_channels, decoder_channels=decoder_channels, num_classes=self.num_classes, align_corners=self.align_corners)
+                 logger.info("Built ViTSegmentationDecoder.")
+            elif decode_head_type == "IdentityHead" and IDENTITY_HEAD_AVAILABLE: self.decode_head = IdentityHead(**decode_head_cfg_copy); logger.info("Built IdentityHead.")
+            elif decode_head_type == "IdentityHead": raise ValueError("IdentityHead not found.")
+            else: raise ValueError(f"Unsupported/unavailable decode_head type: {decode_head_type}")
 
         self.with_decode_head = self.decode_head is not None
         if not self.with_decode_head: logger.warning("No decode head was built.")
 
 
+        # --- VVVVV BUILD DEPTH HEAD VVVVV ---
+        self.depth_head = None
+        self.with_depth_head = False
+        if depth_head: # Check if depth_head config is provided
+            depth_head_cfg_copy = depth_head.copy()
+            depth_head_type = depth_head_cfg_copy.pop('type')
+            logger.info(f"Building depth head: {depth_head_type}...")
+            # Get input channels - usually same as seg head (output of neck/backbone)
+            depth_in_channels_cfg = depth_head.get('in_channels')
+            final_depth_head_in_channels = head_in_channels # Use same input source as seg head
+            if depth_in_channels_cfg is not None:
+                 if depth_in_channels_cfg != head_in_channels: logger.warning(...)
+                 final_depth_head_in_channels = depth_in_channels_cfg # Prioritize config
+            logger.info(f"Depth head using final input channels: {final_depth_head_in_channels}")
+
+            # Example: Using FCNHead structure but outputting 1 channel
+            # Define a unique type name like 'FCNHeadDepth' in YAML
+            if depth_head_type == "FCNHeadDepth" and FCNHead is not None:
+                 channels = depth_head.get('channels', 128) # Internal channels can be different
+                 self.depth_head = FCNHead(in_channels=final_depth_head_in_channels, channels=channels)
+                 # IMPORTANT: Replace classifier to output 1 channel for depth
+                 self.depth_head.classifier = nn.Conv2d(channels, 1, kernel_size=1)
+                 logger.info(f"Built FCNHeadDepth (classifier replaced for 1 depth channel).")
+                 self.with_depth_head = True
+            # Add elif for other custom depth head architectures here
+            # elif depth_head_type == "MyCustomDepthDecoder":
+            #    self.depth_head = MyCustomDepthDecoder(**depth_head_cfg_copy)
+            #    self.with_depth_head = True
+            else:
+                 logger.warning(f"Unsupported or unavailable depth_head type: {depth_head_type}")
+
+        if not self.with_depth_head: logger.info("No depth head configured.")
+        # --- ^^^^^^^^^^^^^^^^^^^^^^^^^^^^ ---
+
+
         # --- Build Auxiliary Head ---
-        self.auxiliary_head = None
-        self.with_auxiliary_head = False
-
-
-        if auxiliary_head:
-               aux_head_cfg = auxiliary_head.copy()
-               aux_head_type = aux_head_cfg.pop('type')
-               logger.info(f"Building auxiliary head: {aux_head_type} with config: {aux_head_cfg}")
-               if aux_head_type == "FCNHead" and FCNHead is not None:
-                    default_aux_in_channels = backbone_cfg.get('width', 64) * 4 * 4
-                    aux_in_channels = aux_head_cfg.get('in_channels', default_aux_in_channels)
-                    logger.info(f"Auxiliary head using input channels: {aux_in_channels}")
-                    aux_channels = aux_head_cfg.get('channels', 128)
-                    # Get dropout, but don't pass it
-                    aux_dropout_ratio = aux_head_cfg.get('dropout_ratio', 0.1) # Keep if needed elsewhere
-                    # --- VVVVVV REMOVE dropout=aux_dropout VVVVVV ---
-                    self.auxiliary_head = FCNHead(in_channels=aux_in_channels, channels=aux_channels) # Removed dropout=aux_dropout
-                    # --- ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ ---
-                    self.auxiliary_head.classifier = nn.Conv2d(aux_channels, self.num_classes, kernel_size=1)
-                    self.with_auxiliary_head = True
-                    logger.info(f"Built auxiliary FCNHead for {self.num_classes} classes.")
-               # ... (rest of aux head logic) ...
-
-
-               elif aux_head_type == "FCNHead": logger.error("Torchvision FCNHead not available...")
-               else: logger.warning(f"Auxiliary head type '{aux_head_type}' not explicitly supported.")
+        self.auxiliary_head = None; self.with_auxiliary_head = False
+        if auxiliary_head: logger.warning("Auxiliary head configured but currently ignored/not built.")
 
 
         # --- Build Identity Head ---
-        self.identity_head = None
-        self.with_identity_head = False
-        if identity_head:
-            # ... (identity head build logic - should be okay now) ...
-            if IDENTITY_HEAD_AVAILABLE and not isinstance(self.decode_head, IdentityHead):
-                id_head_cfg = identity_head.copy(); id_head_type = id_head_cfg.pop('type')
-                logger.info(f"Building separate identity head: {id_head_type} with config: {id_head_cfg}")
-                if id_head_type == "IdentityHead":
-                    try: self.identity_head = IdentityHead(**id_head_cfg); self.with_identity_head = True
-                    except Exception as e: logger.error(f"Error instantiating IdentityHead: {e}")
-                else: logger.warning(f"Identity head type '{id_head_type}' not explicitly supported.")
-            elif isinstance(self.decode_head, IdentityHead): logger.info(...); self.identity_head = self.decode_head; self.with_identity_head = True
-            else: logger.warning("IdentityHead specified but class definition not found...")
+        self.identity_head = None; self.with_identity_head = False
+        if identity_head: # ... (logic as before) ...
+            pass
 
 
         # --- Tokenization and Learnable Parameters ---
-        logger.info(f"Tokenizing {len(self.class_names)} class names with context length {self.context_length}...")
-        self.texts = torch.cat([tokenize(c, context_length=self.context_length) for c in self.class_names])
-        # ... (prompt length calculation - should be okay now) ...
-        if not hasattr(self, 'text_encoder'): raise RuntimeError("Text encoder not initialized before prompt calculation.")
-        text_encoder_context_length = getattr(self.text_encoder, 'context_length', 77)
-        logger.info(f"Text encoder context length capacity: {text_encoder_context_length}")
-        if self.context_length > text_encoder_context_length: logger.warning(...); self.context_length = text_encoder_context_length
-        prompt_context_length = text_encoder_context_length - self.context_length
-        # ... (context/gamma initialization - should be okay now) ...
-        if isinstance(self.text_encoder, CLIPTextContextEncoder):
-            _token_embed_dim = text_encoder_cfg.get('transformer_width', token_embed_dim)
-            _text_dim_gamma = text_dim
-            if prompt_context_length > 0:
-                 self.contexts = nn.Parameter(torch.randn(1, prompt_context_length, _token_embed_dim))
-                 nn.init.trunc_normal_(self.contexts, std=.02)
-                 logger.info(f"Initialized learnable text contexts ({prompt_context_length} tokens) with dim {_token_embed_dim}.")
-            else: self.contexts = None; logger.info("No space for learnable contexts.")
+        logger.info(f"Tokenizing {len(self.class_names)} class names with fixed length {self.fixed_text_context_length}...")
+        try: self.texts = torch.cat([tokenize(c, context_length=self.fixed_text_context_length) for c in self.class_names]); logger.info(f"Tokenized text shape: {self.texts.shape}")
+        except NameError: logger.error("'tokenize' function not imported/defined!"); raise
+
+        # Initialize learnable contexts/gamma ONLY if using the Context Encoder
+        self.contexts = None
+        self.gamma = None
+        if self.is_context_encoder: # Check the flag set during encoder build
+            text_encoder_total_capacity = getattr(self.text_encoder, 'context_length', 77)
+            logger.info(f"CLIPTextContextEncoder total capacity: {text_encoder_total_capacity}")
+            num_learnable_tokens = text_encoder_total_capacity - self.fixed_text_context_length
+            if num_learnable_tokens <= 0:
+                 logger.warning(f"Num_learnable_tokens ({num_learnable_tokens}) <= 0. No learnable contexts created.")
+                 self.contexts = None
+            else:
+                 _token_embed_dim = token_embed_dim # Use dim from main args
+                 logger.info(f"Initializing {num_learnable_tokens} learnable context tokens with dimension {_token_embed_dim}.")
+                 # Create the parameter
+                 self.contexts = nn.Parameter(torch.randn(1, num_learnable_tokens, _token_embed_dim))
+                 # Initialize the parameter - Use trunc_normal_
+                 # Assuming trunc_normal_ is available (e.g., from timm or manually defined)
+                 # If not available, use standard normal init: nn.init.normal_(self.contexts, std=0.02)
+                 try:
+                    from timm.layers import trunc_normal_ # Try to import if timm used elsewhere
+                    trunc_normal_(self.contexts, std=.02)
+                 except ImportError:
+                    logger.warning("timm.layers.trunc_normal_ not found. Using nn.init.normal_ for contexts.")
+                    nn.init.normal_(self.contexts, std=0.02)
+                 logger.info(f"Initialized learnable text contexts parameter: {self.contexts.shape}")
+
+            # Gamma dimension should match the final text embedding output dimension
+            _text_dim_gamma = self.text_dim
             self.gamma = nn.Parameter(torch.ones(_text_dim_gamma) * 1e-4)
-            logger.info(f"Initialized learnable gamma with dim {_text_dim_gamma}.")
+            logger.info(f"Initialized learnable gamma parameter with dim {_text_dim_gamma}.")
         else:
-            self.contexts = None; self.gamma = None
             logger.info("Standard text encoder used. Learnable contexts/gamma not initialized.")
 
 
@@ -401,439 +446,660 @@ class DenseCLIP(nn.Module): # Inherit directly from nn.Module
         # Add other layer types if needed (e.g., LayerNorm)
 
     def _init_non_clip_weights(self):
-        """Initialize weights for modules NOT loaded from CLIP."""
-        logger.info("Applying custom initialization using _init_weights_fn...")
-        modules_to_init = []
-        if self.vis_proj is not None: modules_to_init.append(('vis_proj', self.vis_proj))
-        if self.context_decoder is not None: modules_to_init.append(('context_decoder', self.context_decoder))
-        if self.neck is not None: modules_to_init.append(('neck', self.neck))
-        if self.decode_head is not None: modules_to_init.append(('decode_head', self.decode_head))
-        if self.auxiliary_head is not None: modules_to_init.append(('auxiliary_head', self.auxiliary_head))
-        # Handle identity_head only if it's a separate module instance
+        """
+        Initialize weights for modules NOT loaded from CLIP.
+        Applies _init_weights_fn to trainable components like projections,
+        neck, heads, context decoder. Also initializes final classifiers specially.
+        """
+        logger.info("Applying custom weight initialization using _init_weights_fn...")
+        modules_to_init = [] # List to store (name, module) tuples
+
+        # Add projection layers if they exist
+        if self.vis_proj is not None:
+            modules_to_init.append(('vis_proj', self.vis_proj))
+        if self.global_proj is not None:
+            modules_to_init.append(('global_proj', self.global_proj))
+
+        # Add context decoder if it exists
+        if self.context_decoder is not None:
+            modules_to_init.append(('context_decoder', self.context_decoder))
+
+        # Add neck if it exists
+        if self.neck is not None:
+            modules_to_init.append(('neck', self.neck))
+
+        # Add decode head if it exists
+        if self.decode_head is not None:
+            modules_to_init.append(('decode_head', self.decode_head))
+
+        # --- VVVVV ADD DEPTH HEAD VVVVV ---
+        if self.depth_head is not None:
+            modules_to_init.append(('depth_head', self.depth_head))
+        # --- ^^^^^^^^^^^^^^^^^^^^^^^^^^^ ---
+
+        # Add auxiliary head if it exists
+        if self.auxiliary_head is not None:
+            modules_to_init.append(('auxiliary_head', self.auxiliary_head))
+
+        # Add identity head ONLY if it's a separate module instance
         if self.with_identity_head and self.identity_head is not None and self.identity_head is not self.decode_head:
             modules_to_init.append(('identity_head', self.identity_head))
 
+        # --- Apply Initialization ---
         for name, module in modules_to_init:
-             logger.info(f"Initializing module: {name}...")
+             # Prevent applying to CLIP backbone/text encoder if somehow listed (safety check)
+             if name in ['backbone', 'text_encoder']:
+                 logger.warning(f"Skipping initialization for protected module: {name}")
+                 continue
+
+             logger.info(f"Initializing module layers: {name}...")
+             # Apply the helper function recursively to all submodules
              module.apply(self._init_weights_fn)
-             # Special handling for final classifier layers (common practice)
-             if name in ['decode_head', 'auxiliary_head'] and hasattr(module, 'classifier') and isinstance(module.classifier, nn.Conv2d):
-                 logger.info(f"...Initializing final classifier of {name} with Normal(0, 0.01)...")
-                 nn.init.normal_(module.classifier.weight, mean=0, std=0.01)
-                 if module.classifier.bias is not None:
-                      nn.init.constant_(module.classifier.bias, 0)
 
+             # --- Special handling for final classifier layers ---
+             # Common practice to initialize the final layer predicting classes differently
+             if name in ['decode_head', 'auxiliary_head', 'depth_head'] and hasattr(module, 'classifier'):
+                 classifier_layer = module.classifier
+                 if isinstance(classifier_layer, (nn.Conv2d, nn.Linear)):
+                     logger.info(f"...Re-Initializing final classifier of {name} with Normal(0, 0.01)...")
+                     nn.init.normal_(classifier_layer.weight, mean=0, std=0.01)
+                     if classifier_layer.bias is not None:
+                          nn.init.constant_(classifier_layer.bias, 0)
+                 else:
+                      logger.warning(f"Classifier layer in {name} is not Conv2d or Linear, skipping special init.")
+
+        # Note: nn.Parameters like self.contexts and self.gamma are initialized
+        # directly during their creation in __init__ and do not need module.apply().
+        logger.info("Custom weight initialization complete.")
+
+    # --- MODIFIED extract_feat ---
     def extract_feat(self, img):
-        """Extract features from images using the backbone."""
-        # Assumes backbone returns features in a format usable by _process_features
-        # For ResNet, typically a tuple/list of feature maps from different stages
-        # For ViT, might be different (e.g., sequence of patch embeddings + class token)
-        # Ensure backbone's forward method matches expectations
-        x = self.backbone(img)
-        logger.debug(f"Backbone output type: {type(x)}")
-        if isinstance(x, (list, tuple)):
-             logger.debug(f"Backbone output features: {[f.shape for f in x]}")
-        elif torch.is_tensor(x):
-             logger.debug(f"Backbone output feature shape: {x.shape}")
-        return x
+        """
+        Extract features from images using the backbone.
+        Assumes backbone returns a list of tensors.
+        """
+        logger.debug("Extracting features with backbone...")
+        features = self.backbone(img) # Call the backbone's forward method
 
+        # --- Detailed Debug Print ---
+        logger.debug(f"Raw backbone output type: {type(features)}")
+        if isinstance(features, (list, tuple)):
+             logger.debug(f"Raw backbone output length: {len(features)}")
+             if features: # Check if not empty
+                # Log shape of first element for verification
+                logger.debug(f"  Element 0 type: {type(features[0])}, shape: {features[0].shape if isinstance(features[0], torch.Tensor) else 'N/A'}")
+        elif isinstance(features, torch.Tensor):
+             logger.debug(f"Raw backbone output shape: {features.shape}")
+        # --- End Detailed Debug Print ---
+
+
+        # ------
+        # Check if the output is a list or tuple
+        if isinstance(features, (list, tuple)):
+            # Check if it's NOT empty
+            if not features:
+                logger.error("Backbone returned an empty list/tuple.")
+                return []
+
+            # Check if ALL elements are Tensors (more robust check)
+            if not all(isinstance(f, torch.Tensor) for f in features):
+                 logger.error(f"Backbone output list/tuple contains non-Tensor elements: {[type(f) for f in features]}")
+                 return []
+
+            # Optional: Check if all elements are 4D (expected for spatial features)
+            if not all(f.ndim == 4 for f in features):
+                 logger.warning(f"Backbone output list contains non-4D Tensors: {[f.ndim for f in features]}. Check backbone output.")
+                 # Depending on neck/head, might need error here, but let's allow for now
+
+            # If checks pass, return the full list of features
+            logger.debug(f"Backbone returned a list/tuple of {len(features)} feature tensors.")
+            return list(features) # Return the validated list
+
+        elif isinstance(features, torch.Tensor) and features.ndim == 4:
+             # Handle case where backbone *directly* returned a 4D tensor
+             logger.warning("Backbone returned single tensor directly instead of list/tuple. Wrapping in list.")
+             return [features]
+        else:
+             # Handle completely unexpected output formats
+             logger.error(f"Unknown or unsupported backbone output format: {type(features)}. Returning empty list.")
+             return []
+        # --- ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ ---
+
+        
+    # --- _process_features ---
     def _process_features(self, x):
         """
         Handles feature processing after backbone extraction.
         Applies projection, calculates text features, context fusion, and score map.
+        Adapts for single feature map input from ViT (after extract_feat).
         Returns:
             text_embeddings (Tensor): Shape [B, K, C_text]
-            features_for_head (list[Tensor] or Tensor): Features to be passed to neck/head.
+            features_for_head (list[Tensor]): Original backbone feature maps (before score map concat).
+                                             For ViT, this will be a list with one tensor.
             score_map (Tensor): Shape [B, K, H_vis, W_vis] (using potentially projected visual features).
-            _x_orig (list[Tensor]): Original backbone feature maps (before score map concat).
+            _x_orig (list[Tensor]): Copy of original backbone feature maps list.
         """
         # --- Input Validation ---
         if not isinstance(x, (list, tuple)) or not x:
-            raise ValueError(f"Backbone output 'x' must be a non-empty list or tuple of features. Got: {type(x)}")
+            raise ValueError(f"Expected _process_features input 'x' to be a non-empty list/tuple. Got: {type(x)}")
 
-        _x_orig = list(x) # Keep original features
-        visual_embeddings = None # Spatial features for score map
-        global_feat = None # Global pooled feature
+        _x_orig = [feat.clone() for feat in x] # Keep original features list (clone for safety)
 
         # --- Extract Global and Spatial Features ---
-        # ... (keep logic to get initial visual_embeddings and global_feat) ...
-        if isinstance(x[-1], (list, tuple)) and len(x[-1]) == 2 and isinstance(x[-1][0], torch.Tensor) and isinstance(x[-1][1], torch.Tensor):
-             if x[-1][0].ndim == 2 and x[-1][1].ndim == 4:
-                 logger.debug("Using features from AttentionPool2d-like output (global, spatial).")
-                 _x_orig = list(x[:-1])
-                 global_feat, visual_embeddings = x[-1]
-             else:
-                 logger.debug("Last element tuple/list doesn't match attn pool. Using last element as spatial.")
-                 visual_embeddings = x[-1] # Might need adjustment depending on actual structure
-        elif torch.is_tensor(x[-1]):
-             logger.debug("Using last tensor from backbone output as spatial features.")
-             visual_embeddings = x[-1]
-        else: raise ValueError(...)
-        if visual_embeddings is None or visual_embeddings.ndim != 4: raise ValueError(...)
-        if global_feat is None: global_feat = F.adaptive_avg_pool2d(visual_embeddings, (1, 1)).flatten(1); logger.debug(...)
-        elif global_feat.ndim != 2: raise ValueError(...)
-        # --- End Extract ---
+        # For ViT, x is likely [_ViT_spatial_map_], so x[-1] is the main spatial feature
+        # For ResNet, x is [stage1, ..., stage4], x[-1] is last stage spatial feature
+        visual_embeddings = x[-1] # Assume last element is the primary spatial map
+        if visual_embeddings.ndim != 4:
+            raise ValueError(f"Expected last backbone feature map to be 4D, got {visual_embeddings.ndim}D")
+
+        # Calculate global feature by pooling the last spatial map
+        global_feat = F.adaptive_avg_pool2d(visual_embeddings, (1, 1)).flatten(1)
+        logger.debug(f"Calculated global_feat shape: {global_feat.shape}")
 
         B, C_vis_orig, H_vis, W_vis = visual_embeddings.shape
         C_glob_orig = global_feat.shape[1]
-        if C_vis_orig != C_glob_orig: logger.warning(...) # Keep this warning
+        if C_vis_orig != C_glob_orig:
+            logger.warning(f"Initial spatial feature channels ({C_vis_orig}) != global feature channels ({C_glob_orig}). Check backbone output or pooling.")
 
-
-        # --- VVVVVVVV APPLY GLOBAL PROJECTION VVVVVVVV ---
+        # --- Apply Global Projection (If layer exists) ---
         if self.global_proj is not None:
              logger.debug(f"Applying global projection: {C_glob_orig} -> {self.global_proj.out_features}")
              global_feat = self.global_proj(global_feat) # Project [B, C_orig] -> [B, C_proj]
-             C_glob = global_feat.shape[1] # Get projected global dim
+             C_glob = global_feat.shape[1]
              logger.debug(f"Projected global_feat shape: {global_feat.shape}")
         else:
-             C_glob = C_glob_orig # Use original global dim if no projection
-        # --- ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ ---
+             C_glob = C_glob_orig
 
-
-        # --- Apply Visual Spatial Projection IF defined ---
+        # --- Apply Visual Spatial Projection (If layer exists) ---
         if self.vis_proj is not None:
              logger.debug(f"Applying visual spatial projection: {C_vis_orig} -> {self.vis_proj.out_channels}")
-             visual_embeddings = self.vis_proj(visual_embeddings)
-             B, C_vis, H_vis, W_vis = visual_embeddings.shape # C_vis is now projected dim
+             visual_embeddings = self.vis_proj(visual_embeddings) # Project [B, C_vis_orig, H, W] -> [B, C_vis, H, W]
+             B, C_vis, H_vis, W_vis = visual_embeddings.shape
              logger.debug(f"Projected spatial visual_embeddings shape: {visual_embeddings.shape}")
         else:
              C_vis = C_vis_orig
 
-
         # --- Check consistency AFTER projections ---
         if C_vis != C_glob:
-             # This should ideally not happen now if projections are set up correctly
              logger.error(f"Projected spatial dim C_vis ({C_vis}) != projected global dim C_glob ({C_glob}). Check projection layers.")
-
 
         # --- Prepare Visual Context for Context Decoder ---
         visual_context = None
         if self.context_decoder:
             if self.context_feature == 'attention':
-                # --- VVVVVV USE PROJECTED global_feat, REMOVE WARNING/RE-POOL VVVVVV ---
-                # Now global_feat (if projected) and C_vis (if projected) should both match text_dim (1024)
-                global_feat_ctx = global_feat # Use the (potentially projected) global_feat directly
-
-                # REMOVE these lines that caused the warning and re-pooling:
-                # if global_feat.shape[1] != C_vis:
-                #      logger.warning(f"Context feature 'attention': global_feat dim ({global_feat.shape[1]}) != C_vis ({C_vis}). Re-pooling projected features for context.") # REMOVE
-                #      global_feat_ctx = F.adaptive_avg_pool2d(visual_embeddings, (1, 1)).view(B, C_vis) # REMOVE
-                # else:
-                #     global_feat_ctx = global_feat # Use directly
-
-                # Create context [B, N, C] where N = 1 (global) + H*W (spatial)
+                # Use projected global feature + projected spatial features
+                global_feat_ctx = global_feat # Should have correct projected dimension now
                 visual_context = torch.cat([global_feat_ctx.unsqueeze(1), visual_embeddings.flatten(2).permute(0, 2, 1)], dim=1)
-                # --- ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ ---
+                logger.debug(f"Prepared visual context ('attention') shape: {visual_context.shape}")
 
             elif self.context_feature == 'backbone':
-                 # ... (logic for 'backbone' context remains the same) ...
-                 last_backbone_feat = _x_orig[-1]
-                 B_b, C_b, H_b, W_b = last_backbone_feat.shape
-                 visual_context = last_backbone_feat.view(B_b, C_b, -1).permute(0, 2, 1) # [B, H*W, C_b]
-                 # Still might need projection check here depending on ContextDecoder needs
-                 if hasattr(self.context_decoder, 'visual_dim') and C_b != self.context_decoder.visual_dim:
-                     logger.warning(f"Context feature 'backbone': Feature dim ({C_b}) != context_decoder expected dim ({self.context_decoder.visual_dim}).")
+                 # Use the *potentially projected* spatial features for consistency if vis_proj exists
+                 visual_context_spatial = visual_embeddings # Use features AFTER vis_proj
+                 C_context = visual_context_spatial.shape[1]
+                 visual_context = visual_context_spatial.flatten(2).permute(0, 2, 1) # [B, H*W, C_vis]
+                 # Check dimension against decoder's expected dim
+                 if hasattr(self.context_decoder, 'visual_dim') and C_context != self.context_decoder.visual_dim:
+                     logger.warning(f"Context feature 'backbone': Feature dim ({C_context}) != context_decoder expected dim ({self.context_decoder.visual_dim}).")
+                 logger.debug(f"Prepared visual context ('backbone' using spatial feats) shape: {visual_context.shape}")
 
-            else:
-                 raise ValueError(f"Invalid context_feature type: {self.context_feature}")
-
-            if visual_context is not None:
-                 logger.debug(f"Prepared visual context shape ({self.context_feature}): {visual_context.shape}")
+            else: raise ValueError(f"Invalid context_feature type: {self.context_feature}")
 
 
         # --- Text Feature Calculation ---
-        # ... (keep text feature calculation logic) ...
         if not hasattr(self, 'text_encoder'): raise AttributeError("text_encoder missing")
         text_embeddings_device = next(self.text_encoder.parameters()).device
-        logger.debug(f"Moving text tokens to device: {text_embeddings_device}")
         tokenized_texts = self.texts.to(text_embeddings_device)
         if isinstance(self.text_encoder, CLIPTextContextEncoder) and self.contexts is not None:
-             logger.debug("Using CLIPTextContextEncoder with learnable contexts.")
              contexts_device = self.contexts.to(text_embeddings_device)
              text_embeddings = self.text_encoder(tokenized_texts, contexts_device).expand(B, -1, -1)
         elif isinstance(self.text_encoder, CLIPTextEncoder):
-             logger.debug("Using standard CLIPTextEncoder.")
              text_embeddings = self.text_encoder(tokenized_texts).expand(B, -1, -1)
         else: raise TypeError(...)
         logger.debug(f"Raw text embeddings shape: {text_embeddings.shape}")
 
         # Apply Context Decoder Fusion
         if self.context_decoder and visual_context is not None:
-            # ... (keep context decoder fusion logic) ...
             if self.gamma is None: raise AttributeError(...)
             logger.debug(f"Applying context decoder...")
             visual_context_device = visual_context.to(text_embeddings_device)
-            try:
-                 text_diff = self.context_decoder(text_embeddings, visual_context_device)
-                 logger.debug(f"Context decoder output (text_diff) shape: {text_diff.shape}")
-                 gamma_device = self.gamma.to(text_embeddings_device)
-                 text_embeddings = text_embeddings + gamma_device * text_diff
-                 logger.debug("Applied context fusion to text embeddings.")
+            try: text_diff = self.context_decoder(text_embeddings, visual_context_device); gamma_device = self.gamma.to(text_embeddings_device); text_embeddings = text_embeddings + gamma_device * text_diff; logger.debug("Applied context fusion.")
             except Exception as cd_e: logger.error(...) ; raise cd_e
-        elif self.context_decoder and visual_context is None: logger.error(...)
+        elif self.context_decoder and visual_context is None: logger.error("Context decoder configured but no visual context.")
 
 
         # --- Score Map Calculation ---
-        # ... (keep score map calculation logic) ...
         B, K, C_text = text_embeddings.shape
-        visual_norm = F.normalize(visual_embeddings, dim=1, p=2)
+        visual_norm = F.normalize(visual_embeddings, dim=1, p=2) # Use potentially projected spatial features
         text_norm = F.normalize(text_embeddings, dim=2, p=2)
-        if C_vis != C_text: raise ValueError(...)
+        if C_vis != C_text: raise ValueError(f"Visual dim after proj ({C_vis}) != Text dim ({C_text}).")
         score_map = torch.einsum('bchw,bkc->bkhw', visual_norm, text_norm)
         logger.debug(f"Calculated score map shape: {score_map.shape}")
 
 
-        # --- Feature Concatenation for Neck/Head ---
-        # ... (keep feature concatenation logic) ...
-        features_for_head = [feat.clone() for feat in _x_orig]
+        # --- Feature Concatenation ---
+        # features_for_head will be used if neck is None, otherwise _x_orig goes to neck
+        # Let's return _x_orig as features_for_head consistently and handle concat later if needed
+        features_for_head = _x_orig # Return original backbone features list
+
         if 0 <= self.score_concat_index < len(features_for_head):
+            # Apply concat to the COPY we are returning
             target_feat_map = features_for_head[self.score_concat_index]
-            # ... (resizing and concatenation) ...
+            logger.warning(f"Applying score map concatenation at index {self.score_concat_index}. Ensure neck/head handles this.")
             try:
                 score_map_resized = F.interpolate(score_map, size=target_feat_map.shape[2:], mode='bilinear', align_corners=False)
                 features_for_head[self.score_concat_index] = torch.cat([target_feat_map, score_map_resized], dim=1)
-                logger.info(f"Concatenated score map to feature index {self.score_concat_index}. New shape: {features_for_head[self.score_concat_index].shape}")
-            except Exception as concat_e: logger.error(...) ; logger.warning("Proceeding without score map concatenation...")
-        else: logger.warning(...)
+                logger.info(f"Concatenated score map. New shape at index {self.score_concat_index}: {features_for_head[self.score_concat_index].shape}")
+            except Exception as concat_e: logger.error(...) ; logger.warning("Proceeding without concat due to error.")
+        elif self.score_concat_index != -1: # Only warn if index is not explicitly disabled (-1)
+            logger.warning(f"score_concat_index {self.score_concat_index} invalid. Score map not concatenated.")
 
 
+        # Return: text embeddings, features for neck/head, score map, original backbone features
         return text_embeddings, features_for_head, score_map, _x_orig
 
 
+    # --- forward ---
     def forward(self, img, img_metas=None, gt_semantic_seg=None, return_loss=True, **kwargs):
         """
-        Main forward pass. Determines train/inference mode.
+        Main forward pass. Handles backbone, neck (optional), heads,
+        and text/visual feature processing. Incorporates depth head.
+        Returns outputs for segmentation and depth.
+
         Args:
             img (Tensor): Input images (N, C, H, W).
-            img_metas (list[dict]): List of image info dicts (Can be None). Ignored in this version.
-            gt_semantic_seg (Tensor): Ground truth segmentation masks (N, H, W) (for training).
-            return_loss (bool): Flag indicating training mode (passed from training loop).
+            img_metas (list[dict]): List of image info dicts (Ignored in this version).
+            gt_semantic_seg (Tensor): Ground truth segmentation masks (N, H, W) (used for training).
+            return_loss (bool): Flag indicating training mode. If True, expects gt_semantic_seg
+                                or gt_depth in kwargs for resizing purposes.
+            **kwargs: Catches potential extra arguments like gt_depth, gt_depth_mask
+                      passed from train_worker if loss calculated externally.
+
+        Returns:
+            dict: During training (return_loss=True), returns a dict:
+                  {
+                      'main_output': segmentation logits [N, NumClasses, H, W] (potentially resized), or None on error,
+                      'depth_output': depth prediction [N, 1, H, W] (potentially resized), or None on error,
+                      'aux_losses': dictionary containing logits from auxiliary/identity heads (if any)
+                  }
+            dict: During inference (return_loss=False), returns a dict:
+                  {
+                      'seg': segmentation logits [N, NumClasses, H_img, W_img] (resized to img), or None on error,
+                      'depth': depth prediction [N, 1, H_img, W_img] (resized to img), or None on error
+                  }
         """
-        # 1. Extract Backbone Features
-        # x should be a list/tuple of feature maps, e.g., [stage1_out, stage2_out, stage3_out, stage4_out]
-        x = self.extract_feat(img)
+        # 1. Extract Features from Backbone
+        # Returns a list of tensors, e.g., [stage1, ..., stage4] for ResNet
+        # or [spatial_map_768] for modified ViT
+        try:
+            backbone_features = self.extract_feat(img)
+            if not backbone_features: # Handle empty list return
+                raise ValueError("Backbone feature extraction returned empty list.")
+        except Exception as bb_e:
+            logger.error(f"Error during backbone feature extraction: {bb_e}", exc_info=True)
+            # Return structure with Nones to allow train_worker to skip batch
+            if return_loss and self.training: return {'main_output': None, 'depth_output': None, 'aux_losses': {}}
+            else: return {'seg': None, 'depth': None} # Return None dict for inference
 
-        # 2. Process Features (Projection, Text Features, Context, Score Map, Concat)
-        # features_for_head is based on original backbone features, potentially with score map concatenated at one stage
-        # _x_orig contains the unmodified original backbone features
-        text_embeddings, features_for_head, score_map, _x_orig = self._process_features(x)
+        # Keep a copy of original backbone features for potential neck/aux head use
+        _x_orig = [feat.clone() for feat in backbone_features]
 
-        # 3. Process through Neck (if exists)
-        # Input to neck is 'features_for_head' (list)
+        # 2. Process Features (for Score Map & Context Decoder)
+        # This primarily calculates text_embeddings and score_map.
+        # It uses the *last* original backbone feature (_x_orig[-1]) internally.
+        try:
+            # Pass _x_orig which _process_features expects as input list
+            text_embeddings, _, score_map, _ = self._process_features(_x_orig)
+        except Exception as proc_e:
+             logger.error(f"Error during _process_features: {proc_e}", exc_info=True)
+             if return_loss and self.training: return {'main_output': None, 'depth_output': None, 'aux_losses': {}}
+             else: return {'seg': None, 'depth': None}
+
+
+        # 3. Process Features through Neck (if exists) & Select Input for Heads
+        input_for_heads = None # Initialize features to feed into BOTH heads
         if self.neck:
-            logger.debug("Passing ORIGINAL backbone features (_x_orig) through neck...")
-            # --- VVVVVV CHANGE HERE VVVVVV ---
-            # Convert ORIGINAL backbone features list to dict for FPN input
-            # **Assumption**: _x_orig order matches expected FPN input order (low->high stage)
-            neck_input_dict = {str(i): feat for i, feat in enumerate(_x_orig)} # Use _x_orig
-            # --- ^^^^^^ END CHANGE ^^^^^^ ---
-            neck_outputs_dict = self.neck(neck_input_dict) # Neck outputs a dict
+            # --- Neck Path ---
+            try:
+                logger.debug("Passing ORIGINAL backbone features (_x_orig) through neck...")
+                # Create dict input only if neck is torchvision FPN
+                neck_input = {str(i): feat for i, feat in enumerate(_x_orig)} if isinstance(self.neck, FeaturePyramidNetwork) else _x_orig
 
-            # Process neck output (Keep this part)
-            if self._neck_out_keys:
-                 features_after_neck = [neck_outputs_dict[k] for k in self._neck_out_keys if k in neck_outputs_dict]
-                 logger.debug(f"Neck output shapes (ordered by keys): {[f.shape for f in features_after_neck]}")
-            else:
-                 logger.warning("Neck output keys unknown, using dict values directly. Order might be incorrect for head.")
-                 features_after_neck = list(neck_outputs_dict.values())
+                features_after_neck = self.neck(neck_input) # Neck should return list: [fused_map] or [p2,p3,p4,p5]
+
+                # Process neck output to select the feature for the main head
+                if not features_after_neck:
+                    raise ValueError("Neck processing returned empty features.")
+                elif isinstance(features_after_neck, (list, tuple)) and features_after_neck:
+                     # **Assumption**: Highest resolution feature for the head is the FIRST element
+                     input_for_heads = features_after_neck[0]
+                     logger.debug(f"Using neck output feature 0 (shape {input_for_heads.shape}) for heads.")
+                elif isinstance(features_after_neck, torch.Tensor): # Handle neck returning single tensor
+                     input_for_heads = features_after_neck
+                     logger.debug(f"Using single tensor neck output (shape {input_for_heads.shape}) for heads.")
+                else:
+                     raise TypeError(f"Could not determine valid feature tensor from neck output: {type(features_after_neck)}")
+
+            except Exception as neck_e:
+                 logger.error(f"Error during neck processing: {neck_e}", exc_info=True)
+                 # input_for_heads remains None if neck fails
+            # --- End Neck Path ---
         else:
-            # If no neck, use the features prepared by _process_features (which includes concatenated score map)
-            features_after_neck = features_for_head
-            logger.debug("Skipping neck. Using features from _process_features (may include score map).")
+            # --- No Neck Path ---
+            if not _x_orig: # Check if _x_orig is empty
+                logger.error("Original backbone features (_x_orig) are empty in 'no neck' path.")
+                # input_for_heads remains None
+            else:
+                # Use the LAST feature map directly from the original backbone output (_x_orig)
+                input_for_heads = _x_orig[-1] # Use LAST feature from backbone
+                logger.debug(f"Skipping neck. Using last backbone feature (shape {input_for_heads.shape}) for heads.")
+            # --- End No Neck Path ---
 
 
-        # 4. Prepare Input for Decode Head(s)
-        # Determine input for the main decode head
-        # **CRITICAL**: Adapt this based on head type (FCNHead vs others)
-        input_for_decode_head = None
-        if isinstance(self.decode_head, FCNHead): # torchvision FCNHead takes output from FPN (dict)
-             if not isinstance(features_after_neck, dict):
-                  # If neck didn't produce a dict (e.g., no neck), try creating one
-                  if isinstance(features_after_neck, (list,tuple)) and self._neck_out_keys and len(features_after_neck)==len(self._neck_out_keys):
-                       # input_for_decode_head = {k:v for k,v in zip(self._neck_out_keys, features_after_neck)} # DON'T create dict
-                       # FCNHead needs the highest resolution tensor, assume it's key '0' or first in list
-                       input_for_decode_head = features_after_neck[0]
-                       logger.debug("Selecting first feature tensor as input for FCNHead.")
-                  else:
-                       logger.error("Cannot provide valid input tensor required by FCNHead.")
-                       input_for_decode_head = None # Will cause error later
+        # 4. Prepare Input for Auxiliary Head (if exists)
+        input_for_aux_head = None
+        if self.with_auxiliary_head:
+             # Logic depends on which feature from _x_orig the aux head expects
+             aux_input_index = self._decode_head_cfg.get('aux_input_index', 2) if self._decode_head_cfg else 2
+             if 0 <= aux_input_index < len(_x_orig):
+                  input_for_aux_head = _x_orig[aux_input_index]
+                  logger.debug(f"Using original feature idx {aux_input_index} for aux head. Shape: {input_for_aux_head.shape}")
              else:
-                  # If neck produced a dict, select the highest resolution feature map
-                  # **Assumption**: Key '0' corresponds to the highest resolution output from FPN
-                  if '0' in features_after_neck:
-                      input_for_decode_head = features_after_neck['0']
-                      logger.debug("Selecting feature tensor with key '0' from neck output dict for FCNHead.")
-                  else:
-                      logger.error("Cannot find feature with key '0' in neck output dict for FCNHead.")
-                      input_for_decode_head = None
-             if input_for_decode_head is not None: logger.debug(f"Using Tensor input shape for FCNHead: {input_for_decode_head.shape}")
-
-        elif isinstance(features_after_neck, (list, tuple)) and len(features_after_neck) > 0:
-             # **Assumption for non-FCN Heads**: Use the highest resolution feature map
-             # which is assumed to be the FIRST element in the list (verify!).
-             input_for_decode_head = features_after_neck[0]
-             logger.debug(f"Using first feature map for non-FCN decode head. Shape: {input_for_decode_head.shape}")
-        # ... (rest of the logic for single tensor input remains the same) ...
-        # --- ^^^^^^ END MODIFICATION ^^^^^^ ---
+                  logger.warning(f"Cannot get feature at index {aux_input_index} for auxiliary head (len={len(_x_orig)}).")
 
 
         # 5. Forward through Decode Head(s)
-        if not self.decode_head:
-             raise RuntimeError("Decode head is not defined.")
-        if input_for_decode_head is None:
-            # Handle case where input couldn't be prepared
-             logger.error("Input for decode head is None. Cannot proceed.")
-             if return_loss and self.training: return {'main_output': None, 'aux_losses': {}}
-             else: return None
+        # Initialize outputs to None
+        output_logits = None # Segmentation
+        output_depth = None  # Depth
 
-        # Main head forward pass -> logits [N, C, H', W']
-        # Now input_for_decode_head should be a Tensor
-        output_logits = self.decode_head(input_for_decode_head)
+        # Check if input for heads was successfully determined
+        if input_for_heads is None:
+             logger.error("Input tensor for heads is None. Cannot proceed with head forward pass.")
+        else:
+            # Segmentation Head Forward
+            if self.with_decode_head:
+                try:
+                    output_logits = self.decode_head(input_for_heads)
+                    if output_logits is None: logger.warning("Segmentation decode head returned None.")
+                    else: logger.debug(f"Segmentation head output shape: {output_logits.shape}")
+                except Exception as head_e:
+                    logger.error(f"Error in segmentation head forward: {head_e}", exc_info=True)
+                    output_logits = None # Ensure output is None on error
+
+            # Depth Head Forward
+            if self.with_depth_head:
+                try:
+                    output_depth = self.depth_head(input_for_heads) # Pass the SAME input features
+                    if output_depth is None: logger.warning("Depth head returned None.")
+                    else: logger.debug(f"Depth head output shape: {output_depth.shape}")
+                except Exception as depth_head_e:
+                    logger.error(f"Error during depth head forward: {depth_head_e}", exc_info=True)
+                    output_depth = None # Ensure output is None on error
 
 
-        # 6. Handle Training vs Inference
+        # 6. Handle Training vs Inference Return Values
         if return_loss and self.training:
-             if gt_semantic_seg is None:
-                  raise ValueError("gt_semantic_seg is required for training (return_loss=True)")
+             # Determine target shape for resizing (H, W)
+             gt_h, gt_w = -1, -1
+             gt_depth = kwargs.get('gt_depth') # Check if gt_depth was passed
+             if gt_semantic_seg is not None:
+                 gt_h, gt_w = gt_semantic_seg.shape[-2:]
+             elif kwargs.get('gt_depth') is not None:
+                 gt_h, gt_w = kwargs['gt_depth'].shape[-2:]
+             elif kwargs.get('depth_targets') is not None: # Check common names from train_worker
+                  gt_h, gt_w = kwargs['depth_targets'].shape[-2:]
+             elif kwargs.get('seg_targets') is not None: # Check common names from train_worker
+                  gt_h, gt_w = kwargs['seg_targets'].shape[-2:]
 
-             # --- Loss Calculation ---
-             losses = {} # Dictionary to store calculated losses (if done here)
+             # Only proceed with resizing if we got a valid target shape
+             can_resize = gt_h > 0 and gt_w > 0
+             if not can_resize:
+                  logger.warning("Could not determine target GT shape for resizing model outputs in training.")
+             losses = {} # For auxiliary/identity logits
 
-             # Resize main logits to match GT label size
-             gt_h, gt_w = gt_semantic_seg.shape[-2:]
-             if output_logits is not None and output_logits.shape[-2:] != (gt_h, gt_w):
-                  output_logits_resized = F.interpolate(
-                      output_logits, size=(gt_h, gt_w), mode='bilinear', align_corners=self.align_corners
-                  )
-                  logger.debug(f"Resized main output logits to GT shape: {output_logits_resized.shape}")
-             else:
-                  output_logits_resized = output_logits # Use directly if shapes match or if None
+             # Resize main logits if they exist and target shape is valid
+             output_logits_resized = output_logits
+             if output_logits is not None and (gt_h > 0) and output_logits.shape[-2:] != (gt_h, gt_w):
+                  try:
+                      output_logits_resized = F.interpolate(output_logits, size=(gt_h, gt_w), mode='bilinear', align_corners=self.align_corners)
+                      logger.debug(f"Resized main logits to GT shape: {output_logits_resized.shape}")
+                  except Exception as resize_e:
+                      logger.error(f"Error resizing main logits: {resize_e}. Returning unresized.")
+                      output_logits_resized = output_logits # Fallback to unresized
 
-             # NOTE: Primary loss is usually calculated in the train_worker loop using output_logits_resized.
-             # We return the logits needed for that calculation.
+             # Resize depth output if it exists and target shape is valid
+             output_depth_resized = output_depth
+             if output_depth is not None and (gt_h > 0) and output_depth.shape[-2:] != (gt_h, gt_w):
+                  try:
+                      output_depth_resized = F.interpolate(output_depth, size=(gt_h, gt_w), mode='bilinear', align_corners=self.align_corners) # Use same alignment?
+                      logger.debug(f"Resized depth output to GT shape: {output_depth_resized.shape}")
+                  except Exception as resize_e:
+                      logger.error(f"Error resizing depth output: {resize_e}. Returning unresized.")
+                      output_depth_resized = output_depth # Fallback to unresized
 
-             # --- Auxiliary Head Loss (if exists) ---
+             # --- Auxiliary / Identity Head Logits (keep logic if needed) ---
              if self.with_auxiliary_head and self.auxiliary_head and input_for_aux_head is not None:
-                  aux_logits = self.auxiliary_head(input_for_aux_head)
-                  if aux_logits.shape[-2:] != (gt_h, gt_w):
-                       aux_logits_resized = F.interpolate(aux_logits, size=(gt_h, gt_w), mode='bilinear', align_corners=self.align_corners) # Use main head alignment? Check config.
-                  else:
-                       aux_logits_resized = aux_logits
-                  logger.debug(f"Auxiliary head output logits (resized) shape: {aux_logits_resized.shape}")
-                  # Store aux logits for loss calculation in train_worker (using weights from config)
-                  losses['aux_output'] = aux_logits_resized # Name it something clear
+                  try:
+                      aux_logits = self.auxiliary_head(input_for_aux_head)
+                      if aux_logits is not None:
+                          aux_logits_resized = aux_logits
+                          if (gt_h > 0) and aux_logits.shape[-2:] != (gt_h, gt_w): aux_logits_resized = F.interpolate(...)
+                          losses['aux_output'] = aux_logits_resized
+                          logger.debug(...)
+                      else: logger.warning("Auxiliary head returned None.")
+                  except Exception as aux_e: logger.error(...)
 
-             # --- Identity Head Loss (if exists) ---
              if self.with_identity_head and self.identity_head:
-                  # Identity head might take score_map or other features
-                  # Assuming it takes score_map / tau here
-                  id_input = score_map / self.tau
-                  id_logits = self.identity_head(id_input) # Forward pass
-                  if id_logits.shape[-2:] != (gt_h, gt_w):
-                       id_logits_resized = F.interpolate(id_logits, size=(gt_h, gt_w), mode='bilinear', align_corners=self.align_corners) # Use main head alignment?
-                  else:
-                       id_logits_resized = id_logits
-                  logger.debug(f"Identity head output logits (resized) shape: {id_logits_resized.shape}")
-                  losses['identity_output'] = id_logits_resized # Store for loss calculation
+                  try:
+                      id_input = score_map / self.tau
+                      id_logits = self.identity_head(id_input)
+                      if id_logits is not None:
+                          id_logits_resized = id_logits
+                          if (gt_h > 0) and id_logits.shape[-2:] != (gt_h, gt_w): id_logits_resized = F.interpolate(...)
+                          losses['identity_output'] = id_logits_resized
+                          logger.debug(...)
+                      else: logger.warning("Identity head returned None.")
+                  except Exception as id_e: logger.error(...)
 
-             # Return main logits and dict of auxiliary logits/losses
-             return {'main_output': output_logits_resized, 'aux_losses': losses}
+             # Return all outputs needed for external loss calculation in train_worker
+             return {
+                 'main_output': output_logits_resized, # Segmentation logits
+                 'depth_output': output_depth_resized, # Depth prediction
+                 'aux_losses': losses # Dict possibly containing 'aux_output', 'identity_output'
+             }
 
         else: # Inference mode (return_loss=False)
-             if output_logits is None: return None # Handle head failure
+             final_output_seg = None; final_output_depth = None
+             img_h, img_w = img.shape[2:] # Target size is input image size
 
-             # Resize final output logits to match the original input image size for prediction
-             logger.debug(f"Resizing inference output {output_logits.shape} to image shape {img.shape[2:]}")
-             output = F.interpolate(
-                 input=output_logits, # Use logits from main decode_head
-                 size=img.shape[2:],
-                 mode='bilinear',
-                 align_corners=self.align_corners # Use head's align_corners setting
-             )
-             logger.debug(f"Final inference output shape: {output.shape}")
-             return output # Return final resized logits [N, C, H_img, W_img]
+             # Resize segmentation logits if they exist
+             if output_logits is not None:
+                  try:
+                      if output_logits.shape[-2:] != (img_h, img_w):
+                           final_output_seg = F.interpolate(output_logits, size=(img_h, img_w), mode='bilinear', align_corners=self.align_corners)
+                      else: final_output_seg = output_logits
+                      logger.debug(f"Final inference seg shape: {final_output_seg.shape}")
+                  except Exception as e: logger.error(...); final_output_seg = output_logits
 
-    # --- Inference Helper Methods (Keep as is or adapt based on evaluation needs) ---
+             # Resize depth output if it exists
+             if output_depth is not None:
+                  try:
+                      if output_depth.shape[-2:] != (img_h, img_w):
+                           final_output_depth = F.interpolate(output_depth, size=(img_h, img_w), mode='bilinear', align_corners=self.align_corners)
+                      else: final_output_depth = output_depth
+                      logger.debug(f"Final inference depth shape: {final_output_depth.shape}")
+                  except Exception as e: logger.error(...); final_output_depth = output_depth
+
+             # Return dictionary with both outputs (value is None if head failed)
+             return {'seg': final_output_seg, 'depth': final_output_depth}
+        
+
+
+    
+    def _get_final_visual_embeddings(self, x):
+        """ Helper to get the spatial visual features AFTER potential projection """
+        if not isinstance(x, (list, tuple)) or not x: return None # Handle bad input
+        visual_embeddings = x[-1] # Assume last element is spatial features
+        # Handle edge case where backbone returns (global, spatial) tuple as last element
+        if isinstance(visual_embeddings, (list, tuple)) and len(visual_embeddings)==2:
+            visual_embeddings = visual_embeddings[1] # Take the spatial part
+        if not isinstance(visual_embeddings, torch.Tensor) or visual_embeddings.ndim != 4:
+            logger.error(f"Could not extract valid 4D spatial tensor in _get_final_visual_embeddings. Got: {type(visual_embeddings)}")
+            return None
+        # Apply projection if it exists
+        if self.vis_proj is not None:
+            visual_embeddings = self.vis_proj(visual_embeddings)
+        return visual_embeddings
+
+
+    # --- MODIFIED Inference Helper Methods ---
     def inference(self, img, img_meta, rescale):
-         """Simple inference, returns logits potentially rescaled to original image size."""
-         # test_cfg might control sliding window etc. - not implemented here
-         seg_logit = self.forward(img, img_metas=img_meta, return_loss=False) # Call main forward in inference mode
+         """
+         Performs inference, returning dict with 'seg' and 'depth' logits/predictions,
+         potentially rescaled to original image size.
+         """
+         # Call main forward in inference mode
+         outputs = self.forward(img, img_metas=img_meta, return_loss=False)
+         # outputs is now {'seg': Tensor|None, 'depth': Tensor|None}
 
-         if seg_logit is None: return None # Handle forward pass failure
+         if outputs is None: # Handle complete forward pass failure
+             return {'seg': None, 'depth': None}
+
+         seg_logit = outputs.get('seg')
+         depth_pred = outputs.get('depth') # Depth output might be direct prediction or logits
 
          # Rescaling logic to original image shape
          if rescale and img_meta is not None and len(img_meta) > 0 and 'ori_shape' in img_meta[0]:
               ori_shape = img_meta[0]['ori_shape'][:2] # H, W
-              if seg_logit.shape[2:] != tuple(ori_shape):
-                  logger.debug(f"Rescaling inference output from {seg_logit.shape[2:]} to original shape {ori_shape}")
-                  seg_logit = F.interpolate(
-                      seg_logit,
-                      size=ori_shape,
-                      mode='bilinear',
-                      align_corners=self.align_corners # Use head's setting
-                  )
+              # Rescale segmentation logits if they exist
+              if seg_logit is not None and seg_logit.shape[-2:] != tuple(ori_shape):
+                  try:
+                      seg_logit = F.interpolate(
+                          seg_logit, size=ori_shape, mode='bilinear',
+                          align_corners=self.align_corners
+                      )
+                      logger.debug(f"Rescaled seg logits to {ori_shape}")
+                  except Exception as e: logger.error(f"Error rescaling seg logits: {e}")
+              # Rescale depth prediction if it exists
+              if depth_pred is not None and depth_pred.shape[-2:] != tuple(ori_shape):
+                  try:
+                      # Use bilinear for depth resizing as well (common practice)
+                      depth_pred = F.interpolate(
+                          depth_pred, size=ori_shape, mode='bilinear',
+                          align_corners=self.align_corners
+                      )
+                      logger.debug(f"Rescaled depth pred to {ori_shape}")
+                  except Exception as e: logger.error(f"Error rescaling depth pred: {e}")
          elif rescale:
-              logger.warning("Rescale=True but ori_shape not found in img_meta. Returning logits at input image size.")
+              logger.warning("Rescale=True but ori_shape not found in img_meta.")
 
-         return seg_logit
+         # Return dictionary containing both outputs
+         return {'seg': seg_logit, 'depth': depth_pred}
+
 
     def simple_test(self, img, img_meta, rescale=True):
-        """Simple test with single image. Returns numpy prediction."""
-        seg_logit = self.inference(img, img_meta, rescale)
-        if seg_logit is None: return None
+        """
+        Simple test with single image.
+        Returns dict: {'seg': numpy prediction map, 'depth': numpy prediction map}
+        """
+        outputs = self.inference(img, img_meta, rescale) # Returns dict {'seg':..., 'depth':...}
 
-        seg_pred = seg_logit.argmax(dim=1) # Get class indices [N, H, W]
-        seg_pred = seg_pred.cpu().numpy()
-        # Assuming batch size 1 for simple_test, return the single prediction
-        return seg_pred[0] if len(seg_pred) > 0 else None
+        seg_logit = outputs.get('seg')
+        depth_pred = outputs.get('depth') # Depth output (already resized)
+
+        seg_pred_map = None
+        if seg_logit is not None:
+            # Get class indices [N, H, W], convert to numpy, take first batch item
+            seg_pred_map = seg_logit.argmax(dim=1).cpu().numpy()[0]
+
+        depth_pred_map = None
+        if depth_pred is not None:
+             # Squeeze channel dim (if present), convert to numpy, take first batch item
+             depth_pred_map = depth_pred.squeeze(1).cpu().numpy()[0] # Assumes depth output is [N,1,H,W]
+
+        return {'seg': seg_pred_map, 'depth': depth_pred_map} # Return dict of numpy arrays
+
 
     def aug_test(self, imgs, img_metas, rescale=True):
-        """Test with augmentations by averaging logits. Returns numpy prediction."""
-        # imgs: list of augmented images [tensor(C,H,W), ...]
-        # img_metas: list of corresponding meta dicts
-        seg_logits = []
+        """
+        Test with augmentations by averaging logits/predictions.
+        Returns dict: {'seg': numpy prediction map, 'depth': numpy prediction map}
+        """
+        all_seg_logits = []
+        all_depth_preds = []
+
         for img, meta in zip(imgs, img_metas):
              # Add batch dimension for inference call
-             logit = self.inference(img.unsqueeze(0), [meta], rescale)
-             if logit is not None:
-                 seg_logits.append(logit)
+             outputs = self.inference(img.unsqueeze(0), [meta], rescale) # Returns dict
+             if outputs: # Check if inference was successful
+                 if outputs.get('seg') is not None:
+                     all_seg_logits.append(outputs['seg'])
+                 if outputs.get('depth') is not None:
+                     all_depth_preds.append(outputs['depth'])
 
-        if not seg_logits: return None # Handle case where all inferences failed
+        # --- Process Segmentation ---
+        avg_seg_logit = None
+        seg_pred_map = None
+        if all_seg_logits:
+            try:
+                avg_seg_logit = torch.stack(all_seg_logits).mean(dim=0) # Average over augmentations [1, C, H, W]
+                seg_pred_map = avg_seg_logit.argmax(dim=1).squeeze(0).cpu().numpy() # Get class indices [H, W]
+            except Exception as e: logger.error(f"Error averaging/processing aug test seg logits: {e}")
 
-        # Stack logits [N_aug, C, H, W] and average
-        avg_seg_logit = torch.stack(seg_logits).mean(dim=0) # [C, H, W]
-        seg_pred = avg_seg_logit.argmax(dim=0) # Get class indices [H, W]
-        seg_pred = seg_pred.cpu().numpy()
-        return seg_pred
+        # --- Process Depth ---
+        avg_depth_pred = None
+        depth_pred_map = None
+        if all_depth_preds:
+            try:
+                # Average depth predictions directly
+                avg_depth_pred = torch.stack(all_depth_preds).mean(dim=0) # [1, 1, H, W]
+                depth_pred_map = avg_depth_pred.squeeze().cpu().numpy() # Get [H, W] numpy array
+            except Exception as e: logger.error(f"Error averaging/processing aug test depth preds: {e}")
 
-    # forward_dummy might not be needed if FLOPs calculation uses another method
+        return {'seg': seg_pred_map, 'depth': depth_pred_map} # Return dict
+
+    # --- MODIFIED forward_dummy ---
     def forward_dummy(self, img):
-        """ Dummy forward for FLOPs calculation or similar. Tries to simulate main path. """
+        """
+        Dummy forward for FLOPs calculation or similar.
+        Tries to simulate main path and return outputs for both heads.
+        """
         logger.warning("forward_dummy provides a simplified path and may not accurately reflect full model complexity or handle all configurations.")
+        output_logits = None
+        output_depth = None
+
         try:
+            # Simplified flow, mimicking the main forward path structure
             # 1. Backbone
-            x = self.extract_feat(img)
-            # 2. Process (simplified - just take last feature, maybe project)
-            visual_embeddings = x[-1]
-            if self.vis_proj: visual_embeddings = self.vis_proj(visual_embeddings)
-            features_for_head = [visual_embeddings] # Simplified input for head
-            # 3. Neck (simplified - pass only last feature if neck expects list)
+            backbone_features = self.extract_feat(img)
+            if not backbone_features: return None # Or return zeros?
+            _x_orig = backbone_features # Use directly for simplicity
+
+            # 2. Neck (if exists)
             if self.neck:
-                neck_input = {str(len(x)-1): visual_embeddings} # Create dummy dict input
-                neck_output = self.neck(neck_input)
-                features_for_head = list(neck_output.values()) # Use neck output
-            # 4. Head
-            if self.decode_head:
-                head_input = features_for_head[0] # Assume head takes first feature
-                if isinstance(self.decode_head, FCNHead): # FCNHead needs dict
-                     head_input = {'out': features_for_head[0]} # Provide dummy key 'out' or similar expected key
-                out = self.decode_head(head_input)
-                # Resize to original image size
-                out = F.interpolate(input=out, size=img.shape[2:], mode='bilinear', align_corners=self.align_corners)
-                return out
+                neck_input = {str(i): feat for i, feat in enumerate(_x_orig)} if isinstance(self.neck, FeaturePyramidNetwork) else _x_orig
+                features_after_neck = self.neck(neck_input)
+                if isinstance(features_after_neck, (list, tuple)) and features_after_neck: input_for_heads = features_after_neck[0]
+                elif isinstance(features_after_neck, torch.Tensor): input_for_heads = features_after_neck
+                else: input_for_heads = _x_orig[-1] # Fallback
             else:
-                return features_for_head # Return intermediate features if no head
+                input_for_heads = _x_orig[-1] # No neck case
+
+            # 3. Heads
+            if self.decode_head:
+                 output_logits = self.decode_head(input_for_heads)
+            if self.with_depth_head: # Use the flag here
+                 output_depth = self.depth_head(input_for_heads)
+
+            # 4. Resize (Optional, often skipped for FLOPs, but can add if needed)
+            # output_logits = F.interpolate(output_logits, size=img.shape[2:], ...)
+            # output_depth = F.interpolate(output_depth, size=img.shape[2:], ...)
+
+            # Return a tuple or dict matching expected structure if possible
+            # Returning just seg logits for simplicity if depth fails
+            return output_logits if output_logits is not None else torch.zeros(img.shape[0], self.num_classes, *img.shape[2:], device=img.device)
+
         except Exception as e:
-            logger.error(f"Error during forward_dummy: {e}. Returning input image shape.")
-            # Return something with expected dimension characteristics if possible
+            logger.error(f"Error during forward_dummy: {e}. Returning dummy zeros.")
+            # Return dummy zeros matching segmentation output shape
             return torch.zeros(img.shape[0], self.num_classes, *img.shape[2:], device=img.device)

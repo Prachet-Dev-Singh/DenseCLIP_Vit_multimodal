@@ -1,0 +1,67 @@
+# Ignore Python cache and compiled files
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Ignore environment files
+venv/
+.denseclip_env/
+*.env
+
+# Ignore logs and temporary files
+logs/
+*.log
+
+# Ignore Jupyter Notebook checkpoints
+.ipynb_checkpoints/
+
+# Ignore dataset and model files (if applicable)
+data/
+models/
+checkpoints/
+*.h5
+*.pth
+
+
+/detection/
+
+
+
+
+
+
+/ADEChallengeData2016.zip
+/Miniconda3-latest-Linux-x86_64.sh
+/Python-3.10.13.tgz
+
+
+segmentation/release_test/testing/*.jpg
+
+# Ignore log files
+*.log
+logs/
+log/
+work_dirs/**/*.log
+
+# Ignore TensorBoard logs
+segmentation/work_dirs/**/tf_logs/
+
+# Ignore general log and temp files
+*.log
+*.gcda
+
+
+# Ignore large model files
+segmentation/pretrained/ViT-B-16.pt
+segmentation/pretrained/RN101.pt
+segmentation/pretrained/RN50.pt
+
+# Ignore compressed and release files
+segmentation/release_test.zip
+segmentation/Miniconda3-latest-Linux-x86_64.sh
+
+work_dirs/
+release_test/
+
+Python-3.10.13/
