@@ -1,9 +1,10 @@
 # configs/denseclip_cityscapes.yaml
+# Use this file for the multitask part Seg + Depth
 
 # Data configuration
 data:
   dataset_type: 'CityscapesDepthSegDataset' # <<< CHANGE: Use the new dataset class
-  path: 'data/cityscapes'                 # <<< VERIFY: Path containing leftImg8bit, gtFine, disparity, camera dirs
+  path: '/home/aryan/soham/Parth/data/'                 # <<< VERIFY: Path containing leftImg8bit, gtFine, disparity, camera dirs
   classes: 19                              # Number of segmentation classes (used by dataset/metrics)
   ignore_label: 255                        # Ignore index for segmentation
   depth_max: 80.0                          # Optional: Max depth value to consider valid in dataset (meters)
@@ -16,7 +17,7 @@ data:
 # Model configuration
 model:
   type: 'DenseCLIP'
-  clip_pretrained: '/home/22dcs005/DenseCLIP/segmentation/pretrained/ViT-B-16.pt' # <<< VERIFY: Correct absolute path to ViT weights
+  clip_pretrained: '/home/aryan/soham/Parth/DenseCLIP_Vit_multimodal/segmentation/pretrained/ViT-B-16.pt' # <<< VERIFY: Correct absolute path to ViT weights
   text_dim: 512             # <<< Target shared dimension (matches standard CLIP Text output)
   context_length: 6           # <<< Length for FIXED class name tokens passed to tokenizer
   token_embed_dim: 512      # <<< Dimension of the learnable context vectors (usually matches text encoder width)
