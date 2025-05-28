@@ -292,7 +292,7 @@ def build_dataloader(cfg, rank=0, world_size=1):
 # --- Validation Function (Enhanced with TorchMetrics and Visualization) ---
 @torch.no_grad() # Ensure no gradients are computed during validation
 def validate(model, val_loader, criterions, loss_weights, epoch, writer, logger, device, work_dir,
-             num_seg_classes, ignore_index_seg, rank, depth_ignore_value=DEPTH_IGNORE_VALUE):
+             num_seg_classes, ignore_index_seg, depth_ignore_value, cfg, rank):
     """
     Multi-task validation function (Segmentation + Depth).
     Calculates losses (optional) and metrics for both tasks.
@@ -313,8 +313,11 @@ def validate(model, val_loader, criterions, loss_weights, epoch, writer, logger,
         depth_ignore_value (float): Value indicating invalid pixels in depth GT.
     """
 
-    print(f"--- DEBUG: ENTERING validate function for Epoch {epoch} ---")
+    logger.debug(f"--- DEBUG: ENTERING validate function for Epoch {epoch} ---")
     logger.info(f"--- Starting Validation Execution for Epoch: {epoch} ---") # Use logger too
+
+    
+
     is_primary_process = not dist.is_initialized() or rank == 0 
     if not is_primary_process:
         if dist.is_initialized(): dist.barrier(); return # Sync non-primary processes and exit
@@ -328,6 +331,13 @@ def validate(model, val_loader, criterions, loss_weights, epoch, writer, logger,
     total_loss_seg = 0.0
     total_loss_depth = 0.0 # Sum of depth components (e.g., SILog + L1)
     num_valid_batches = 0 # Count batches where loss was successfully computed
+
+
+    # VVVVV INITIALIZE METRIC VARIABLES HERE VVVVV
+    mean_iou_seg = None
+    pixel_acc_seg = None
+    rmse_depth = None # Or other depth metrics you might compute
+    # ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
 
     # --- Initialize Metrics ---
     val_seg_jaccard = None; val_seg_accuracy = None # Segmentation
@@ -375,64 +385,193 @@ def validate(model, val_loader, criterions, loss_weights, epoch, writer, logger,
 
     with torch.no_grad(): # Ensure no gradients are computed
         for i, batch_data in enumerate(val_loader):
-            if batch_data is None: logger.warning(f"Skipping empty val batch {i}."); val_pbar.update(1); continue
+            logger.debug(f"--- VAL LOOP START: Processing batch index {i} ---") # Changed to print
+
+            if batch_data is None:
+                logger.debug(f"VAL Batch {i} WARNING: Skipping empty val batch.") # Changed to print
+                val_pbar.update(1)
+                continue
 
             try:
-                # --- Unpack Data (4 items) ---
-                if isinstance(batch_data, (list, tuple)) and len(batch_data) == 4:
-                    images, seg_targets, depth_targets, depth_masks = batch_data
-                else: logger.error(f"Unexpected val batch format: {type(batch_data)}. Skipping."); val_pbar.update(1); continue
-                if images is None or seg_targets is None or depth_targets is None or depth_masks is None:
-                    logger.error(f"Val batch {i} has None data. Skipping."); val_pbar.update(1); continue
+                logger.debug(f"VAL Batch {i} DEBUG: Inside main try block, before data unpacking.") # DEBUG Point 1
+                # --- Unpack Data (Flexible) ---
+                current_dataset_type = cfg['data'].get('dataset_type', 'Unknown')
+                logger.debug(f"VAL Batch {i} DEBUG: current_dataset_type: {current_dataset_type}") # DEBUG Point 2
 
-                # Move data, ensure shapes/types
+                images, seg_targets, depth_targets, depth_masks = None, None, None, None # Initialize
+
+                if current_dataset_type == 'CityscapesDepthSegDataset':
+                    if len(batch_data) == 4:
+                        images, seg_targets, depth_targets, depth_masks = batch_data
+                    else:
+                        logger.debug(f"VAL Batch {i} ERROR: Expected 4 items for CityscapesDepthSegDataset, got {len(batch_data)}. Skipping.")
+                        val_pbar.update(1); continue
+                elif current_dataset_type == 'ADE20KSegmentation':
+                    if len(batch_data) == 2:
+                        images, seg_targets = batch_data
+                        # depth_targets, depth_masks remain None
+                    else:
+                        logger.debug(f"VAL Batch {i} ERROR: Expected 2 items for ADE20KSegmentation, got {len(batch_data)}. Skipping.")
+                        val_pbar.update(1); continue
+                else:
+                    logger.debug(f"VAL Batch {i} ERROR: Unknown dataset_type '{current_dataset_type}'. Skipping.")
+                    val_pbar.update(1); continue
+                
+                logger.debug(f"VAL Batch {i} DEBUG: Data unpacked. Image is None: {images is None}, Seg_target is None: {seg_targets is None}") # DEBUG Point 3
+
+                if images is None or (current_dataset_type == 'ADE20KSegmentation' and seg_targets is None) or \
+                   (current_dataset_type == 'CityscapesDepthSegDataset' and (seg_targets is None or depth_targets is None or depth_masks is None)):
+                    logger.debug(f"VAL Batch {i} ERROR: Critical data is None after unpacking. Skipping.")
+                    val_pbar.update(1); continue
+
+                # Move data
                 images = images.to(device, non_blocking=True)
-                seg_targets = seg_targets.to(device, non_blocking=True).long()       # [B, H, W]
-                depth_targets = depth_targets.to(device, non_blocking=True).float().unsqueeze(1) # [B, 1, H, W]
-                depth_masks = depth_masks.to(device, non_blocking=True).bool().unsqueeze(1)      # [B, 1, H, W]
+                if seg_targets is not None: seg_targets = seg_targets.to(device, non_blocking=True).long()
+                if depth_targets is not None: depth_targets = depth_targets.to(device, non_blocking=True).float().unsqueeze(1)
+                if depth_masks is not None: depth_masks = depth_masks.to(device, non_blocking=True).bool().unsqueeze(1)
+                logger.debug(f"VAL Batch {i} DEBUG: Data moved to device.") # DEBUG Point 4
 
                 # --- Forward Pass ---
-                outputs = model_to_eval(images, return_loss=False) # Returns {'seg':..., 'depth':...}
-
-                # --- Extract Outputs ---
-                seg_logits = outputs.get('seg')   # [B, NumCls, H, W] or None
-                depth_pred = outputs.get('depth') # [B, 1, H, W] or None
+                outputs = model_to_eval(images, return_loss=False)
+                logger.debug(f"VAL Batch {i} DEBUG: Model forward pass completed. Outputs keys: {list(outputs.keys()) if outputs else 'None'}") # DEBUG Point 5
+                
+                seg_logits = outputs.get('seg')
+                depth_pred = outputs.get('depth')
                 batch_has_seg = seg_logits is not None
                 batch_has_depth = depth_pred is not None
-                if not batch_has_seg and not batch_has_depth: logger.error(...); val_pbar.update(1); continue
+                logger.debug(f"VAL Batch {i} DEBUG: seg_logits is None: {seg_logits is None}, depth_pred is None: {depth_pred is None}") # DEBUG Point 6
 
-                # --- Resize Outputs (Optional but safer if model output size varies) ---
-                gt_h, gt_w = seg_targets.shape[-2:] if batch_has_seg else depth_targets.shape[-2:]
-                seg_logits_resized = seg_logits; depth_pred_resized = depth_pred
-                align_corners_flag = getattr(model_to_eval, 'align_corners', False)
-                if batch_has_seg and seg_logits.shape[-2:] != (gt_h, gt_w):
-                     try: seg_logits_resized = F.interpolate(seg_logits, size=(gt_h, gt_w), mode='bilinear', align_corners=align_corners_flag)
-                     except Exception as e: logger.warning(f"Error resizing val seg logits: {e}"); # Use original on error
-                if batch_has_depth and depth_pred.shape[-2:] != (gt_h, gt_w):
-                     try: depth_pred_resized = F.interpolate(depth_pred, size=(gt_h, gt_w), mode='bilinear', align_corners=align_corners_flag)
-                     except Exception as e: logger.warning(f"Error resizing val depth pred: {e}"); # Use original on error
+                if not batch_has_seg and not batch_has_depth:
+                    logger.debug(f"VAL Batch {i} ERROR: Both seg and depth outputs are None from model. Skipping loss calc.")
+                    # The detailed loss calculation block below will be skipped naturally if batch_has_seg/depth are false
+                
+                # --- Resize Outputs ---
+                seg_logits_resized, depth_pred_resized = seg_logits, depth_pred # Default to original if no resize needed or error
+                if batch_has_seg or batch_has_depth: # Only try to get gt_shape if there's something to resize
+                    # Determine gt_h, gt_w safely
+                    if seg_targets is not None:
+                        gt_h, gt_w = seg_targets.shape[-2:]
+                    elif depth_targets is not None: # For seg-only, depth_targets will be None
+                        gt_h, gt_w = depth_targets.shape[-2:]
+                    else: # Should not happen if images and at least one target type is present
+                        logger.debug(f"VAL Batch {i} ERROR: Cannot determine gt_shape for resizing. Using image shape.")
+                        gt_h, gt_w = images.shape[-2:]
 
+
+                    align_corners_flag = getattr(model_to_eval, 'align_corners', False)
+                    if batch_has_seg and seg_logits.shape[-2:] != (gt_h, gt_w):
+                        try: seg_logits_resized = F.interpolate(seg_logits, size=(gt_h, gt_w), mode='bilinear', align_corners=align_corners_flag)
+                        except Exception as e: logger.debug(f"VAL Batch {i} WARNING: Error resizing val seg logits: {e}")
+                    if batch_has_depth and depth_pred.shape[-2:] != (gt_h, gt_w):
+                        try: depth_pred_resized = F.interpolate(depth_pred, size=(gt_h, gt_w), mode='bilinear', align_corners=align_corners_flag)
+                        except Exception as e: logger.debug(f"VAL Batch {i} WARNING: Error resizing val depth pred: {e}")
+                    logger.debug(f"VAL Batch {i} DEBUG: Outputs resized (or attempted).") # DEBUG Point 7
+                else:
+                    logger.debug(f"VAL Batch {i} DEBUG: No outputs from model to resize.")
 
                 # --- Calculate Losses (Optional) ---
-                batch_loss_combined = 0.0
-                loss_seg = torch.tensor(0.0, device=device)
-                loss_depth = torch.tensor(0.0, device=device)
+                batch_loss_combined = 0.0 # Will be overwritten if criterions exist
+                loss_seg = torch.tensor(0.0, device=device, requires_grad=False)
+                loss_depth = torch.tensor(0.0, device=device, requires_grad=False) # Will hold sum of depth components
+
+                logger.debug(f"VAL Batch {i}: batch_has_seg: {batch_has_seg}, batch_has_depth: {batch_has_depth}")
+
                 if criterions:
                     # Seg Loss
                     if batch_has_seg and 'seg' in criterions:
-                         try: loss_seg = criterions['seg'](seg_logits_resized, seg_targets)
-                         except Exception as e: logger.warning(f"Error calc val seg loss: {e}")
-                    # Depth Loss
-                    if batch_has_depth and 'silog' in criterions:
-                        try: loss_depth_silog = criterions['silog'](depth_pred_resized, depth_targets, depth_masks); loss_depth += loss_depth_silog
-                        except Exception as e: logger.warning(f"Error calc val depth SILog loss: {e}")
-                    # (Add other depth loss calcs here)
+                         try:
+                             # ===== VVVVV DEBUG INPUTS TO SEG LOSS (VALIDATION) VVVVV =====
+                             if seg_logits_resized is not None:
+                                 logger.debug(f"VAL Batch {i} Input to SegLoss: seg_logits_resized shape: {seg_logits_resized.shape}, dtype: {seg_logits_resized.dtype}")
+                                 if seg_logits_resized.numel() > 0: logger.debug(f"VAL Batch {i} Input to SegLoss: seg_logits_resized min: {seg_logits_resized.min().item():.4f}, max: {seg_logits_resized.max().item():.4f}, has_nan: {torch.isnan(seg_logits_resized).any().item()}")
+                             else:
+                                 logger.debug(f"VAL Batch {i} Input to SegLoss: seg_logits_resized is None!")
+                             if seg_targets is not None:
+                                 logger.debug(f"VAL Batch {i} Input to SegLoss: seg_targets shape: {seg_targets.shape}, dtype: {seg_targets.dtype}, min_val: {seg_targets.min().item()}, max_val: {seg_targets.max().item()}")
+                                 # Check for ignore_index if it's a common issue
+                                 # logger.debug(f"VAL Batch {i} Input to SegLoss: seg_targets unique values sample: {torch.unique(seg_targets[:100])}")
+                             else:
+                                 print(f"VAL Batch {i} Input to SegLoss: seg_targets is None!")
+                             # ===== ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ =====
 
-                    batch_loss_combined = loss_weights.get('seg', 1.0)*loss_seg + loss_weights.get('silog', 1.0)*loss_depth
-                    if not (torch.isnan(batch_loss_combined) or torch.isinf(batch_loss_combined)):
-                        total_loss_combined += batch_loss_combined.item(); total_loss_seg += loss_seg.item(); total_loss_depth += loss_depth.item()
+                             loss_seg = criterions['seg'](seg_logits_resized, seg_targets)
+                             logger.debug(f"VAL Batch {i}: loss_seg raw calculated: {loss_seg.item():.4f}")
+                         except Exception as e:
+                             logger.error(f"Error calc val seg loss for batch {i}: {e}", exc_info=True)
+                             loss_seg = torch.tensor(0.0, device=device, requires_grad=False)
+
+                    # Depth Loss (will be skipped/zero for ADE20K as batch_has_depth will be False)
+                    if batch_has_depth and 'silog' in criterions: # 'silog' should match the key in your criterions dict
+                        try:
+                            # ===== VVVVV DEBUG INPUTS TO DEPTH LOSS (VALIDATION) VVVVV =====
+                            if depth_pred_resized is not None:
+                                logger.debug(f"VAL Batch {i} Input to DepthLoss: depth_pred_resized shape: {depth_pred_resized.shape}, dtype: {depth_pred_resized.dtype}")
+                                if depth_pred_resized.numel() > 0: logger.debug(f"VAL Batch {i} Input to DepthLoss: depth_pred_resized min: {depth_pred_resized.min().item():.4f}, max: {depth_pred_resized.max().item():.4f}, has_nan: {torch.isnan(depth_pred_resized).any().item()}")
+                            else:
+                                logger.debug(f"VAL Batch {i} Input to DepthLoss: depth_pred_resized is None!")
+                            if depth_targets is not None:
+                                logger.debug(f"VAL Batch {i} Input to DepthLoss: depth_targets shape: {depth_targets.shape}, dtype: {depth_targets.dtype}")
+                                if depth_targets.numel() > 0: logger.debug(f"VAL Batch {i} Input to DepthLoss: depth_targets min: {depth_targets.min().item():.4f}, max: {depth_targets.max().item()}")
+                            else:
+                                logger.debug(f"VAL Batch {i} Input to DepthLoss: depth_targets is None!")
+                            if depth_masks is not None:
+                                logger.debug(f"VAL Batch {i} Input to DepthLoss: depth_masks shape: {depth_masks.shape}, sum_true: {torch.sum(depth_masks).item()}")
+                            else:
+                                logger.debug(f"VAL Batch {i} Input to DepthLoss: depth_masks is None!")
+                            # ===== ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ =====
+                            
+                            if torch.sum(depth_masks).item() > 0: # Only compute if mask has valid pixels
+                                loss_depth_silog_component = criterions['silog'](depth_pred_resized, depth_targets, depth_masks)
+                                loss_depth += loss_depth_silog_component # Accumulate if you have multiple depth losses
+                                logger.debug(f"VAL Batch {i}: loss_depth_silog_component raw calculated: {loss_depth_silog_component.item():.4f}")
+                            else:
+                                logger.debug(f"VAL Batch {i}: No valid pixels in depth_mask for SILog loss. Depth loss component is 0.")
+                        except Exception as e:
+                            logger.error(f"Error calc val depth SILog loss for batch {i}: {e}", exc_info=True)
+                            # loss_depth remains its current value
+
+                    # (Add other depth loss calcs here and add to loss_depth)
+
+                    # Get loss weights safely
+                    current_seg_loss_weight = loss_weights.get('seg', 1.0)
+                    current_depth_loss_weight = loss_weights.get('silog', 0.0) # Default to 0.0 for depth if key is missing
+
+                    logger.debug(f"VAL Batch {i}: current_seg_loss_weight: {current_seg_loss_weight}, current_depth_loss_weight: {current_depth_loss_weight}")
+                    logger.debug(f"VAL Batch {i}: Before combining - loss_seg: {loss_seg.item() if torch.is_tensor(loss_seg) and loss_seg.numel()==1 else loss_seg}, loss_depth: {loss_depth.item() if torch.is_tensor(loss_depth) and loss_depth.numel()==1 else loss_depth}")
+
+                    # Ensure loss_seg and loss_depth are scalar float tensors for multiplication
+                    if not (torch.is_tensor(loss_seg) and loss_seg.numel() == 1):
+                        logger.debug(f"VAL Batch {i}: loss_seg is not a scalar tensor, converting. Value: {loss_seg}")
+                        try: loss_seg = torch.tensor(float(loss_seg), device=device, dtype=torch.float32)
+                        except: loss_seg = torch.tensor(0.0, device=device, dtype=torch.float32) # Fallback
+                    if not (torch.is_tensor(loss_depth) and loss_depth.numel() == 1):
+                        logger.debug(f"VAL Batch {i}: loss_depth is not a scalar tensor, converting. Value: {loss_depth}")
+                        try: loss_depth = torch.tensor(float(loss_depth), device=device, dtype=torch.float32)
+                        except: loss_depth = torch.tensor(0.0, device=device, dtype=torch.float32) # Fallback
+
+                    batch_loss_combined = current_seg_loss_weight * loss_seg + \
+                                          current_depth_loss_weight * loss_depth
+
+                    logger.debug(f"VAL Batch {i}: batch_loss_combined calculated: {batch_loss_combined.item() if torch.is_tensor(batch_loss_combined) and batch_loss_combined.numel()==1 else batch_loss_combined}")
+                    
+                    # Check for NaN/Inf in the combined loss
+                    is_nan_combined = torch.isnan(batch_loss_combined).any().item() if torch.is_tensor(batch_loss_combined) else np.isnan(float(batch_loss_combined))
+                    is_inf_combined = torch.isinf(batch_loss_combined).any().item() if torch.is_tensor(batch_loss_combined) else np.isinf(float(batch_loss_combined))
+                    logger.debug(f"VAL Batch {i}: isnan_combined: {is_nan_combined}, isinf_combined: {is_inf_combined}")
+
+                    if not (is_nan_combined or is_inf_combined):
+                        total_loss_combined += batch_loss_combined.item()
+                        # Accumulate individual UNWEIGHTED losses for epoch averaging
+                        if torch.is_tensor(loss_seg) and not torch.isnan(loss_seg).any(): total_loss_seg += loss_seg.item()
+                        if torch.is_tensor(loss_depth) and not torch.isnan(loss_depth).any(): total_loss_depth += loss_depth.item()
                         num_valid_batches += 1
-                    else: logger.warning(f"NaN/Inf loss in val batch {i}.")
+                        logger.debug(f"VAL Batch {i}: num_valid_batches incremented to {num_valid_batches}")
+                    else:
+                        logger.debug(f"NaN/Inf batch_loss_combined in val batch {i}. Not incrementing num_valid_batches.")
+                        logger.debug(f"VAL Batch {i}: num_valid_batches remains {num_valid_batches}")
+                else: # if not criterions:
+                    logger.debug(f"VAL Batch {i}: No criterions provided. Cannot calculate validation loss.")
+                    # num_valid_batches will not increment if losses aren't calculated
 
 
                 # --- Update Metrics ---
@@ -443,7 +582,7 @@ def validate(model, val_loader, criterions, loss_weights, epoch, writer, logger,
                             preds_seg = torch.argmax(seg_logits_resized.detach(), dim=1)
                             if val_seg_jaccard: val_seg_jaccard.update(preds_seg, seg_targets)
                             if val_seg_accuracy: val_seg_accuracy.update(preds_seg, seg_targets)
-                        except Exception as e: logger.error(f"Error updating val seg metrics: {e}")
+                        except Exception as e: logger.debug(f"Error updating val seg metrics: {e}")
                     # Depth
                     if batch_has_depth:
                         try:
@@ -453,7 +592,7 @@ def validate(model, val_loader, criterions, loss_weights, epoch, writer, logger,
                              if valid_preds.numel() > 0:
                                  if val_depth_rmse: val_depth_rmse.update(valid_preds, valid_targets)
                                  # if val_depth_absrel: val_depth_absrel.update(...)
-                        except Exception as e: logger.error(f"Error updating val depth metrics: {e}")
+                        except Exception as e: logger.debug(f"Error updating val depth metrics: {e}")
 
                     # Check for Best Image (Seg Accuracy)
                     if batch_has_seg and 'preds_seg' in locals():
@@ -467,14 +606,16 @@ def validate(model, val_loader, criterions, loss_weights, epoch, writer, logger,
                                                      depth_pred_resized[0].cpu() if batch_has_depth else None,
                                                      depth_targets[0].cpu() if batch_has_depth else None,
                                                      depth_masks[0].cpu() if batch_has_depth else None)
-                        except Exception as e: logger.error(f"Error checking best image: {e}")
+                        except Exception as e: logger.debug(f"Error checking best image: {e}")
 
-            except Exception as batch_e: logger.error(f"Critical error in val batch {i}: {batch_e}", exc_info=True)
+            except Exception as batch_e: logger.debug(f"Critical error in val batch {i}: {batch_e}", exc_info=True)
             finally: val_pbar.update(1);
+            
 
     val_pbar.close()
 
     # --- Compute Final Metrics ---
+    logger.debug(f"VAL End of Loop: num_valid_batches: {num_valid_batches}, total_loss_combined: {total_loss_combined}, total_loss_seg: {total_loss_seg}") # DEBUG
     avg_loss_combined = total_loss_combined / num_valid_batches if num_valid_batches > 0 else 0.0
     avg_loss_seg = total_loss_seg / num_valid_batches if num_valid_batches > 0 else 0.0
     avg_loss_depth = total_loss_depth / num_valid_batches if num_valid_batches > 0 else 0.0
@@ -517,9 +658,27 @@ def validate(model, val_loader, criterions, loss_weights, epoch, writer, logger,
     # --- Visualize Best Image ---
     if best_image_data:
         img, seg_pred, seg_gt, depth_pred, depth_gt, depth_mask = best_image_data
-        try: save_path = osp.join(output_vis_dir, f"epoch{epoch}_best_seg_acc_{best_batch_seg_accuracy:.2f}.png"); visualize_multi_task(img, seg_pred, seg_gt, depth_pred, depth_gt, depth_mask, save_path, epoch); logger.info(f"Saved best validation image visualization to: {save_path}")
-        except NameError: logger.warning("'visualize_multi_task' not defined. Skipping visualization.")
-        except Exception as vis_e: logger.error(f"Error during best image visualization: {vis_e}")
+        try:
+            save_path = osp.join(output_vis_dir, f"epoch{epoch}_best_seg_acc_{best_batch_seg_accuracy:.2f}.png")
+            # VVVVV MODIFIED CALL VVVVV
+            visualize_multi_task(
+                img_tensor=img,
+                seg_pred_tensor=seg_pred,
+                seg_target_tensor=seg_gt,
+                depth_pred_tensor=depth_pred,
+                depth_target_tensor=depth_gt,
+                depth_mask_tensor=depth_mask,
+                save_path=save_path,
+                epoch=epoch,
+                num_seg_classes=num_seg_classes # <<< PASS THIS (it's an arg to validate function)
+                # depth_ignore_value_viz=depth_ignore_value # Also an arg to validate
+            )
+            # logger.info(f"Saved best validation image visualization to: {save_path}") # visualize_multi_task logs this now
+            # ^^^^^^^^^^^^^^^^^^^^^^^^^
+        # except NameError: # This should be resolved by defining the function
+        #     logger.warning("'visualize_multi_task' not defined. Skipping visualization.")
+        except Exception as vis_e:
+            logger.error(f"Error during best image visualization call: {vis_e}", exc_info=True) # Add exc_info
 
     # --- DDP Synchronization ---
     if dist.is_initialized(): dist.barrier()
@@ -530,27 +689,158 @@ def validate(model, val_loader, criterions, loss_weights, epoch, writer, logger,
 # Example placeholder:
 def visualize_multi_task(img_tensor, seg_pred_tensor, seg_target_tensor,
                          depth_pred_tensor, depth_target_tensor, depth_mask_tensor,
-                         save_path, epoch, mean=None, std=None, depth_ignore_value=DEPTH_IGNORE_VALUE):
-     logger.warning(f"Multi-task visualization to {save_path} needs full implementation.")
-     # Basic implementation to save at least segmentation:
-     try:
-         if mean is None: mean = (0.48145466, 0.4578275, 0.40821073)
-         if std is None: std = (0.26862954, 0.26130258, 0.27577711)
-         img_np = img_tensor.numpy().transpose(1, 2, 0); img_np = std * img_np + mean
-         img_np = np.clip(img_np, 0, 1) * 255; img_np = img_np.astype(np.uint8)
-         seg_pred_np = seg_pred_tensor.numpy().astype(np.uint8)
-         seg_target_np = seg_target_tensor.numpy().astype(np.uint8)
-         num_seg_classes = max(seg_pred_np.max(), seg_target_np.max()) + 1
-         seg_pred_colored = cv2.applyColorMap((seg_pred_np * 255 // num_seg_classes), cv2.COLORMAP_JET)
-         seg_target_colored = cv2.applyColorMap((seg_target_np * 255 // num_seg_classes), cv2.COLORMAP_JET)
-         fig, axes = plt.subplots(1, 3, figsize=(18, 6))
-         axes[0].imshow(img_np); axes[0].set_title("Input"); axes[0].axis('off')
-         axes[1].imshow(seg_target_colored); axes[1].set_title("Seg GT"); axes[1].axis('off')
-         axes[2].imshow(seg_pred_colored); axes[2].set_title("Seg Pred"); axes[2].axis('off')
-         plt.suptitle(f"Epoch {epoch} - Best Seg Accuracy Sample (Seg Only Viz)"); plt.tight_layout()
-         plt.savefig(save_path); plt.close(fig)
-     except Exception as e: logger.error(f"Basic visualization failed: {e}")
-     pass
+                         save_path, epoch, mean=None, std=None,
+                         num_seg_classes=19, # Pass this from your config or dataset
+                         depth_ignore_value_viz=DEPTH_IGNORE_VALUE): # Use a distinct name for clarity
+    """
+    Visualizes input image, segmentation prediction/GT, and depth prediction/GT.
+    """
+    logger.info(f"Attempting multi-task visualization for epoch {epoch} to {save_path}")
+
+    if mean is None: mean = np.array([0.48145466, 0.4578275, 0.40821073])
+    if std is None: std = np.array([0.26862954, 0.26130258, 0.27577711])
+
+    # 1. De-normalize and prepare Input Image
+    try:
+        img_np = img_tensor.numpy().transpose(1, 2, 0) # CHW -> HWC
+        img_np = std * img_np + mean
+        img_np = np.clip(img_np, 0, 1) * 255
+        img_np = img_np.astype(np.uint8)
+    except Exception as e:
+        logger.error(f"Error processing input image for visualization: {e}")
+        return # Cannot proceed without image
+
+    # 2. Prepare Segmentation Maps
+    seg_pred_np = None
+    seg_target_np = None
+    seg_pred_colored = None
+    seg_target_colored = None
+
+    if seg_pred_tensor is not None and seg_target_tensor is not None:
+        try:
+            seg_pred_np = seg_pred_tensor.numpy().astype(np.uint8)
+            seg_target_np = seg_target_tensor.numpy().astype(np.uint8)
+
+            # Ensure they are 2D (H, W)
+            if seg_pred_np.ndim == 3: seg_pred_np = seg_pred_np.squeeze()
+            if seg_target_np.ndim == 3: seg_target_np = seg_target_np.squeeze()
+            if seg_pred_np.ndim != 2 or seg_target_np.ndim != 2:
+                raise ValueError("Seg maps are not 2D after processing.")
+
+            # Create colormapped versions
+            # To apply colormap, input must be CV_8UC1. Values should be 0-255.
+            # We can map class indices to a 0-255 range if num_seg_classes is small,
+            # or use a fixed palette if available. For now, simple scaling.
+            # Note: max(seg_pred_np.max(), seg_target_np.max()) + 1 might be problematic if only background is predicted.
+            # Using num_seg_classes directly (assuming it's accurate and > 0).
+            
+            # Create a distinct color for each class index up to num_seg_classes
+            # This requires a palette. For simplicity, we'll use JET, but it's not ideal for semantic seg.
+            # A better approach would be to use CityscapesDataset.PALETTE
+            
+            # Simple scaling for cv2.applyColorMap (assuming 0-18 class labels)
+            pred_scaled_for_cmap = (seg_pred_np * (255 // (num_seg_classes -1 + 1e-6))).astype(np.uint8)
+            target_scaled_for_cmap = (seg_target_np * (255 // (num_seg_classes -1 + 1e-6))).astype(np.uint8)
+
+            seg_pred_colored = cv2.applyColorMap(pred_scaled_for_cmap, cv2.COLORMAP_JET)
+            seg_target_colored = cv2.applyColorMap(target_scaled_for_cmap, cv2.COLORMAP_JET)
+        except Exception as e:
+            logger.error(f"Error processing segmentation maps for visualization: {e}")
+            # Continue to try visualizing depth if seg fails
+
+    # 3. Prepare Depth Maps
+    depth_pred_np = None
+    depth_target_np = None
+    depth_pred_colored = None
+    depth_target_colored = None
+
+    if depth_pred_tensor is not None and depth_target_tensor is not None and depth_mask_tensor is not None:
+        try:
+            depth_pred_np = depth_pred_tensor.numpy().squeeze() # Remove channel dim
+            depth_target_np = depth_target_tensor.numpy().squeeze()
+            depth_mask_np = depth_mask_tensor.numpy().squeeze().astype(bool)
+
+            # Apply mask: set ignored regions to a value that will map to black/distinct color
+            # Or, more simply, just visualize what's there and note the mask isn't explicitly applied here.
+            # For colormap visualization, normalize valid depth values to 0-255.
+
+            # Target Depth
+            valid_depth_gt = depth_target_np[depth_mask_np & (depth_target_np > depth_ignore_value_viz)]
+            if valid_depth_gt.size > 0:
+                min_gt, max_gt = valid_depth_gt.min(), valid_depth_gt.max()
+                depth_target_norm = np.zeros_like(depth_target_np, dtype=np.uint8)
+                if max_gt > min_gt:
+                    depth_target_norm[depth_mask_np] = ((np.clip(depth_target_np[depth_mask_np], min_gt, max_gt) - min_gt) / (max_gt - min_gt + 1e-6) * 255).astype(np.uint8)
+                depth_target_colored = cv2.applyColorMap(depth_target_norm, cv2.COLORMAP_MAGMA) # Or VIRIDIS, INFERNO
+            else:
+                depth_target_colored = np.zeros_like(img_np) # Black if no valid GT
+
+            # Predicted Depth (normalize based on GT's valid range for better comparison, or its own range)
+            valid_depth_pred = depth_pred_np[depth_mask_np & (depth_target_np > depth_ignore_value_viz)] # Use GT mask for pred normalization range
+            if valid_depth_pred.size > 0:
+                # Use GT's min/max for normalizing prediction for visual consistency
+                min_norm, max_norm = (min_gt, max_gt) if valid_depth_gt.size > 0 else (valid_depth_pred.min(), valid_depth_pred.max())
+                
+                depth_pred_norm = np.zeros_like(depth_pred_np, dtype=np.uint8)
+                if max_norm > min_norm:
+                     # Apply mask from GT to prediction visualization for fairness
+                    temp_pred_masked = np.where(depth_mask_np, depth_pred_np, min_norm -1) # values outside mask won't contribute to normalization
+                    depth_pred_norm = ((np.clip(temp_pred_masked, min_norm, max_norm) - min_norm) / (max_norm - min_norm + 1e-6) * 255).astype(np.uint8)
+                    depth_pred_norm[~depth_mask_np] = 0 # Make non-masked area black
+
+                depth_pred_colored = cv2.applyColorMap(depth_pred_norm, cv2.COLORMAP_MAGMA)
+            else:
+                depth_pred_colored = np.zeros_like(img_np)
+
+        except Exception as e:
+            logger.error(f"Error processing depth maps for visualization: {e}")
+
+    # 4. Create Plot
+    num_rows = 1
+    num_cols = 1 # Start with just input image
+    if seg_pred_colored is not None and seg_target_colored is not None:
+        num_cols += 2
+    if depth_pred_colored is not None and depth_target_colored is not None:
+        if num_cols == 1: num_cols +=2 # if seg was not plotted
+        else: # seg was plotted, decide if new row or extend cols
+            if num_cols + 2 <= 5: # Max 5 columns for readability
+                 num_cols += 2
+            else: # Not enough space in one row, make two rows
+                 num_rows = 2
+                 num_cols = max(3, num_cols) # Ensure enough columns for a 2-row layout
+
+    fig, axes = plt.subplots(num_rows, num_cols, figsize=(6 * num_cols, 6 * num_rows))
+    axes = np.array(axes).ravel() # Flatten axes array for easy indexing
+
+    ax_idx = 0
+    axes[ax_idx].imshow(img_np); axes[ax_idx].set_title("Input Image"); axes[ax_idx].axis('off'); ax_idx += 1
+
+    if seg_target_colored is not None:
+        axes[ax_idx].imshow(seg_target_colored); axes[ax_idx].set_title("Seg GT"); axes[ax_idx].axis('off'); ax_idx += 1
+    if seg_pred_colored is not None:
+        axes[ax_idx].imshow(seg_pred_colored); axes[ax_idx].set_title("Seg Pred"); axes[ax_idx].axis('off'); ax_idx += 1
+    
+    # If we moved to a new row for depth, and seg was plotted, ax_idx might need adjustment
+    if num_rows == 2 and ax_idx <= (num_cols//num_rows) and (seg_pred_colored is not None): # Heuristic
+        ax_idx = num_cols // num_rows # Start depth on the second row if first row was for img+seg
+
+    if depth_target_colored is not None:
+        axes[ax_idx].imshow(depth_target_colored); axes[ax_idx].set_title("Depth GT (Masked, Norm)"); axes[ax_idx].axis('off'); ax_idx += 1
+    if depth_pred_colored is not None:
+        axes[ax_idx].imshow(depth_pred_colored); axes[ax_idx].set_title("Depth Pred (Masked, Norm)"); axes[ax_idx].axis('off'); ax_idx += 1
+
+    # Turn off any remaining unused axes
+    for i in range(ax_idx, len(axes)):
+        axes[i].axis('off')
+
+    fig.suptitle(f"Validation Epoch {epoch} - Multi-Task Sample", fontsize=16)
+    plt.tight_layout(rect=[0, 0.03, 1, 0.95])
+    try:
+        plt.savefig(save_path)
+        logger.info(f"Successfully saved multi-task visualization to {save_path}")
+    except Exception as e:
+         logger.error(f"Failed to save multi-task visualization '{save_path}': {e}")
+    plt.close(fig)
 
 # --- Visualization Helper Function ---
 def visualize_comparison(img_tensor, pred_tensor, target_tensor, save_path, epoch, mean=None, std=None):
@@ -895,66 +1185,151 @@ def train_worker(rank, world_size, args, cfg, state_dict=None):
                  if pbar: pbar.update(1); continue
 
              try: # Unpack Data
-                 if isinstance(batch_data, (list, tuple)) and len(batch_data) == 4:
-                     images, seg_targets, depth_targets, depth_masks = batch_data
-                 else: logger.error(...)
-                 if pbar: pbar.update(1); continue
-                 if images is None or seg_targets is None or depth_targets is None or depth_masks is None: logger.error(...)
-                 if pbar: pbar.update(1); continue
-                 images = images.to(device, non_blocking=True)
-                 seg_targets = seg_targets.to(device, non_blocking=True).long()
-                 depth_targets = depth_targets.to(device, non_blocking=True).float().unsqueeze(1) # B,1,H,W
-                 depth_masks = depth_masks.to(device, non_blocking=True).bool().unsqueeze(1)   # B,1,H,W
-             except Exception as data_e: logger.error(f"Error unpacking batch {i}: {data_e}")
-             if pbar: pbar.update(1); continue
+                # Determine what to unpack based on the dataset_type from config
+                current_dataset_type = cfg['data'].get('dataset_type', 'Unknown')
+                if current_dataset_type == 'CityscapesDepthSegDataset':
+                    if len(batch_data) == 4:
+                        images, seg_targets, depth_targets, depth_masks = batch_data
+                    else:
+                        logger.error(f"Batch {i}: Expected 4 items for CityscapesDepthSegDataset, got {len(batch_data)}. Skipping batch.")
+                        if pbar: pbar.update(1);
+                        continue
+                elif current_dataset_type == 'ADE20KSegmentation':
+                    if len(batch_data) == 2:
+                        images, seg_targets = batch_data
+                        depth_targets, depth_masks = None, None # Explicitly set to None
+                    else:
+                        logger.error(f"Batch {i}: Expected 2 items for ADE20KSegmentation, got {len(batch_data)}. Skipping batch.")
+                        if pbar: pbar.update(1);
+                        continue
+                else: # Fallback for unknown or other dataset types
+                    logger.error(f"Batch {i}: Unknown dataset_type '{current_dataset_type}' or unhandled batch data length {len(batch_data)}. Skipping batch.")
+                    if pbar: pbar.update(1);
+                    continue
+
+                # Move to device
+                images = images.to(device, non_blocking=True)
+                if seg_targets is not None:
+                    seg_targets = seg_targets.to(device, non_blocking=True).long()
+                if depth_targets is not None: # These will be None for ADE20K
+                    depth_targets = depth_targets.to(device, non_blocking=True).float().unsqueeze(1)
+                if depth_masks is not None: # These will be None for ADE20K
+                    depth_masks = depth_masks.to(device, non_blocking=True).bool().unsqueeze(1)
+
+             except Exception as data_e:
+                 logger.error(f"Error unpacking or moving batch {i} to device: {data_e}", exc_info=True)
+                 if pbar: pbar.update(1);
+                 continue # Skip this problematic batch
 
              try: # Process batch
                  # --- Forward Pass ---
                  model_output = model(images, gt_semantic_seg=seg_targets, gt_depth=depth_targets, return_loss=True)
+                 logger.debug(f"TRAIN_LOOP_DEBUG Batch {i}: model_output keys: {list(model_output.keys()) if model_output else 'None'}")
 
                  # --- Extract Outputs ---
                  main_logits = model_output.get('main_output')
                  depth_pred = model_output.get('depth_output')
                  aux_losses_dict = model_output.get('aux_losses', {})
 
-                 # --- Calculate Combined Loss ---
-                 loss_seg = torch.tensor(0.0, device=device); loss_depth = torch.tensor(0.0, device=device)
-                 total_aux_loss_weighted = torch.tensor(0.0, device=device)
-                 valid_batch = True
+                #  # ===== VVVVV ADD MORE DEBUG PRINTS HERE VVVVV =====
+                #  if main_logits is not None:
+                #      logger.debug(f"TRAIN_LOOP_DEBUG Batch {i}: main_logits shape: {main_logits.shape}, dtype: {main_logits.dtype}, device: {main_logits.device}")
+                #      if main_logits.numel() > 0: logger.debug(f"TRAIN_LOOP_DEBUG Batch {i}: main_logits min: {main_logits.min().item():.4f}, max: {main_logits.max().item():.4f}, has_nan: {torch.isnan(main_logits).any().item()}")
+                #      logger.debug(f"TRAIN_LOOP_DEBUG Batch {i}: seg_targets shape: {seg_targets.shape}, dtype: {seg_targets.dtype}, device: {seg_targets.device}")
+                #  else:
+                #      logger.warning(f"TRAIN_LOOP_DEBUG Batch {i}: main_logits is None!")
 
-                 # Seg Loss
+                #  if depth_pred is not None:
+                #      logger.debug(f"TRAIN_LOOP_DEBUG Batch {i}: depth_pred shape: {depth_pred.shape}, dtype: {depth_pred.dtype}, device: {depth_pred.device}")
+                #      if depth_pred.numel() > 0: logger.debug(f"TRAIN_LOOP_DEBUG Batch {i}: depth_pred min: {depth_pred.min().item():.4f}, max: {depth_pred.max().item():.4f}, has_nan: {torch.isnan(depth_pred).any().item()}")
+                #      logger.debug(f"TRAIN_LOOP_DEBUG Batch {i}: depth_targets shape: {depth_targets.shape}, dtype: {depth_targets.dtype}, device: {depth_targets.device}")
+                #      logger.debug(f"TRAIN_LOOP_DEBUG Batch {i}: depth_masks shape: {depth_masks.shape}, dtype: {depth_masks.dtype}, sum_true: {torch.sum(depth_masks).item()}")
+                #  else:
+                #      #logger.warning(f"TRAIN_LOOP_DEBUG Batch {i}: depth_pred is None!")
+                #      logger.debug(f"TRAIN_LOOP_DEBUG Batch {i}: depth_pred is None! (Expected for seg-only)")
+                #  # ===== ^^^^^ END MORE DEBUG PRINTS ^^^^^ =====
+
+                 loss_seg = torch.tensor(0.0, device=device, requires_grad=False)
+                 loss_depth = torch.tensor(0.0, device=device, requires_grad=False) # This will hold the sum of depth loss components
+                 total_aux_loss_weighted = torch.tensor(0.0, device=device, requires_grad=False) # Assuming no aux losses for now
+
+                 # For logging the specific SILog component value
+                 loss_depth_silog_val = 0.0
+
+                 seg_loss_computed_successfully = False
+                 depth_loss_computed_successfully = False
+
+                 # Seg Loss Calculation
                  if main_logits is not None:
-                     try: loss_seg = criterion_seg(main_logits, seg_targets)
-                     except Exception as e: logger.warning(f"Seg loss error: {e}"); loss_seg = torch.tensor(0.0, device=device)
-                 else: logger.warning("main_output None."); valid_batch = False
+                     try:
+                         loss_seg = criterion_seg(main_logits, seg_targets)
+                         seg_loss_computed_successfully = True
+                         logger.debug(f"TRAIN_LOOP_DEBUG Batch {i}: Seg loss computed: {loss_seg.item():.4f}, requires_grad: {loss_seg.requires_grad}")
+                     except Exception as e:
+                         logger.warning(f"Seg loss error batch {i}: {e}", exc_info=True)
+                         # loss_seg remains 0.0, seg_loss_computed_successfully remains False
+                 else:
+                     
+                     #logger.warning(f"TRAIN_LOOP_DEBUG Batch {i}: main_logits (segmentation output) is None. Cannot compute seg loss.")
+                     logger.debug(f"TRAIN_LOOP_DEBUG Batch {i}: depth_pred (depth output) is None. Cannot compute depth loss. (Expected for seg-only)")
 
-                 # Depth Loss(es)
+                 # Depth Loss(es) Calculation
                  if depth_pred is not None:
-                     loss_depth_silog_val = torch.tensor(0.0, device=device) # Store value for logging
-                     try: # SILog
-                         # --- VVVVV CORRECTED SILog CALL (positional or keyword) VVVVV ---
-                         loss_depth_silog = criterion_depth_silog(depth_pred, depth_targets, depth_masks)
-                         loss_depth_silog_val = loss_depth_silog.item() # Get value before accumulation
-                         loss_depth += loss_depth_silog # Accumulate depth components
-                         # --- ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ ---
-                     except Exception as e: logger.error(f"Error calc SILog loss: {e}", exc_info=True)
-                     # (Optional: Add other depth losses like L1, add to loss_depth)
-                 else: logger.warning("depth_output None."); valid_batch = False # Consider if depth failure invalidates batch
+                     try:
+                         if torch.sum(depth_masks).item() > 0: # Only compute if there are valid pixels in the mask
+                            current_silog_loss = criterion_depth_silog(depth_pred, depth_targets, depth_masks)
+                            loss_depth_silog_val = current_silog_loss.item() # For logging
+                            loss_depth += current_silog_loss # Accumulate to overall depth loss
+                            depth_loss_computed_successfully = True
+                            logger.debug(f"TRAIN_LOOP_DEBUG Batch {i}: Depth SILog loss computed: {current_silog_loss.item():.4f}, requires_grad: {current_silog_loss.requires_grad}")
+                         else:
+                            logger.warning(f"Batch {i}: No valid pixels in depth_mask for SILog loss. SILog component is 0.")
+                            # loss_depth_silog_val remains 0.0
+                            # depth_loss_computed_successfully remains False if this was the only depth loss component
+                     except Exception as e:
+                         logger.error(f"Error calculating SILog loss batch {i}: {e}", exc_info=True)
+                         loss_depth_silog_val = -1.0 # Indicate error for logging
+                         # depth_loss_computed_successfully remains False or its previous state
+                 else:
+                     #logger.warning(f"TRAIN_LOOP_DEBUG Batch {i}: depth_pred (depth output) isloss_for_backward None. Cannot compute depth loss.")
+                     logger.debug(f"TRAIN_LOOP_DEBUG Batch {i}: depth_pred (depth output) is None. Cannot compute depth loss. (Expected for seg-only)")
 
-                 # (Calculate aux losses here if applicable)
+                 # (Calculate other aux losses here if applicable and update total_aux_loss_weighted)
 
-                 # Combine
-                 if valid_batch:
+                 # Determine if the batch is valid for performing a backward pass
+                 # A batch is valid if at least one of its task losses was successfully computed and requires grad
+                 valid_batch_for_backward = (seg_loss_computed_successfully and loss_seg.requires_grad) or \
+                                            (depth_loss_computed_successfully and loss_depth.requires_grad)
+                                            # Or add condition for aux_loss.requires_grad if you have aux losses
+
+                 if not valid_batch_for_backward:
+                     logger.warning(f"TRAIN_LOOP_DEBUG Batch {i}: No valid, gradient-requiring loss computed for any task. Skipping backward.")
+
+
+                 # Combine Weighted Losses
+                 if valid_batch_for_backward:
                      total_batch_loss = (loss_weights.get('seg', 1.0) * loss_seg +
-                                         loss_weights.get('silog', 1.0) * loss_depth + # Use accumulated depth loss
-                                         total_aux_loss_weighted)
+                                         loss_weights.get('silog', 1.0) * loss_depth + # loss_depth is the sum of depth components
+                                         total_aux_loss_weighted) # Assuming aux_loss is already weighted or weight is 1
                      loss_for_backward = total_batch_loss / grad_accum_steps
-                 else: logger.warning(f"Skipping backward for batch {i}.")
-                 if pbar: pbar.update(1); continue
+                     logger.debug(f"TRAIN_LOOP_DEBUG Batch {i}: total_batch_loss (weighted): {total_batch_loss.item():.4f}, loss_for_backward: {loss_for_backward.item():.4f}")
+                 else:
+                     # If not valid for backward, create dummy tensors to allow loop to proceed without error
+                     # but these won't contribute to training.
+                     total_batch_loss = torch.tensor(0.0, device=device)
+                     loss_for_backward = torch.tensor(0.0, device=device, requires_grad=False) # No grad needed
 
-                 # --- Check NaN/Inf & Backward Pass ---
-                 if torch.isnan(loss_for_backward) or torch.isinf(loss_for_backward): logger.error(...); continue
-                 loss_for_backward.backward()
+                # --- Check NaN/Inf & Backward Pass ---
+                 if torch.isnan(loss_for_backward) or torch.isinf(loss_for_backward):
+                     logger.error(f"NaN/Inf loss_for_backward: {loss_for_backward.item()}. Skipping backward batch {i}.")
+                 elif main_logits is None and depth_pred is None: # valid_batch is False here (both outputs were None)
+                     logger.debug(f"Batch {i}: Both outputs None, no backward pass performed.")
+                 else: # At least one loss component should be valid, or all are.
+                    # If loss_for_backward is 0.0 due to one head being None but the other producing a valid 0 loss,
+                    # backward() on 0.0 is fine.
+                     loss_for_backward.backward()
+
+            
 
                  # --- Update Training Metrics ---
                  if train_metrics_available:
@@ -983,27 +1358,46 @@ def train_worker(rank, world_size, args, cfg, state_dict=None):
                       optimizer.step(); optimizer.zero_grad()
 
                  # --- Logging ---
-                 batch_loss = total_batch_loss.item()
-                 epoch_loss_total += batch_loss; epoch_loss_seg += loss_seg.item(); epoch_loss_depth += loss_depth.item() # Use accumulated depth loss value
-                 num_processed_batches += 1
-                 if rank == 0:
-                      current_lr = optimizer.param_groups[0]['lr']
-                      if writer: # ... (log batch losses to writer) ...
-                          pass
-                      if pbar: pbar.set_postfix(loss=f"{batch_loss:.3f}(S:{loss_seg.item():.2f},D:{loss_depth_silog_val:.3f})", lr=f"{current_lr:.6f}") # Use silog value here
+                 if valid_batch_for_backward: # Only accumulate and log if batch was processed for loss
+                    batch_loss_val_for_epoch_sum = total_batch_loss.item() # Value for logging
+                    epoch_loss_total += batch_loss_val_for_epoch_sum
+                    epoch_loss_seg += (loss_seg.item() if torch.is_tensor(loss_seg) and not torch.isnan(loss_seg) else 0.0)
+                    epoch_loss_depth += (loss_depth.item() if torch.is_tensor(loss_depth) and not torch.isnan(loss_depth) else 0.0)
+                    num_processed_batches += 1 # Increment here
+
+                    if rank == 0:
+                        current_lr = optimizer.param_groups[0]['lr']
+                        if writer:
+                            step = epoch * len(train_loader) + i # Approx step
+                            writer.add_scalar('train_batch/loss_total', batch_loss_val_for_epoch_sum, step)
+                            if main_logits is not None and torch.is_tensor(loss_seg) and not torch.isnan(loss_seg):
+                                writer.add_scalar('train_batch/loss_seg', loss_seg.item(), step)
+                            if depth_pred is not None and torch.is_tensor(loss_depth_silog_val) and not np.isnan(loss_depth_silog_val): # loss_depth_silog_val is float
+                                writer.add_scalar('train_batch/loss_depth_silog', loss_depth_silog_val, step)
+                        if pbar:
+                            pbar.set_postfix(loss=f"{batch_loss_val_for_epoch_sum:.3f}(S:{loss_seg.item() if torch.is_tensor(loss_seg) else 0.0:.2f},D:{loss_depth_silog_val:.3f})", lr=f"{current_lr:.6f}")
+                 elif rank == 0 and pbar: # Batch was skipped for loss (both outputs were None)
+                     pbar.set_postfix(loss="invalid_batch", lr=f"{optimizer.param_groups[0]['lr']:.6f}")
+
 
              except Exception as batch_e: logger.error(f"Error processing train batch {i}: {batch_e}", exc_info=True)
              finally: 
                  if pbar: pbar.update(1); batch_start_time = time.time()
+
+             
         # --- End Batch Loop ---
 
         if pbar: pbar.close()
 
         # --- Epoch End ---
+        logger.debug(f"END_OF_EPOCH_DEBUG: num_processed_batches for epoch {epoch}: {num_processed_batches}") # ADD THIS
         avg_epoch_loss_total = epoch_loss_total / num_processed_batches if num_processed_batches > 0 else 0.0
         avg_epoch_loss_seg = epoch_loss_seg / num_processed_batches if num_processed_batches > 0 else 0.0
         avg_epoch_loss_depth = epoch_loss_depth / num_processed_batches if num_processed_batches > 0 else 0.0
         current_lr_end = optimizer.param_groups[0]['lr']
+
+        
+        
 
         # --- Compute and Log Training Metrics (Both Tasks) ---
         log_msg_train = f"--- Epoch {epoch}/{total_epochs-1} Finished ---\n"
@@ -1080,6 +1474,7 @@ def train_worker(rank, world_size, args, cfg, state_dict=None):
                           num_seg_classes=num_classes, # Seg specific
                           ignore_index_seg=ignore_idx_from_data, # Seg specific
                           depth_ignore_value=DEPTH_IGNORE_VALUE, # Pass depth ignore value
+                          cfg=cfg,
                           rank=rank
                       )
                       # --- ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ ---
@@ -1094,9 +1489,37 @@ def train_worker(rank, world_size, args, cfg, state_dict=None):
 
         # --- Save Checkpoint ---
         if rank == 0 and (epoch + 1) % save_interval == 0:
-            checkpoint_path = osp.join(...) # ... (Save checkpoint including scheduler state) ...
-            pass
+            # Define the path to save the checkpoint
+            checkpoint_filename = f'epoch_{epoch+1}.pth'
+            checkpoint_path = osp.join(effective_work_dir, 'checkpoints', checkpoint_filename)
+            
+            # Ensure the directory for checkpoints exists
+            os.makedirs(osp.dirname(checkpoint_path), exist_ok=True)
 
+            # Prepare the state dictionary to save
+            model_state_to_save = model.module.state_dict() if is_ddp else model.state_dict()
+            state_to_save = {
+                'epoch': epoch,
+                'state_dict': model_state_to_save,
+                'optimizer': optimizer.state_dict(),
+                # 'config': cfg, # Optionally save the config too
+                # 'best_metric': best_val_metric, # If you track a best validation metric
+            }
+            if scheduler: # Add scheduler state if a scheduler exists
+                state_to_save['scheduler'] = scheduler.state_dict()
+
+            try:
+                torch.save(state_to_save, checkpoint_path)
+                logger.info(f"Checkpoint saved to {checkpoint_path}")
+                
+                # Optional: Save a copy as 'latest.pth' for easy resuming
+                latest_checkpoint_path = osp.join(effective_work_dir, 'checkpoints', 'latest.pth')
+                torch.save(state_to_save, latest_checkpoint_path)
+                logger.info(f"Latest checkpoint saved to {latest_checkpoint_path}")
+
+            except Exception as e:
+                logger.error(f"Failed to save checkpoint to {checkpoint_path}: {e}", exc_info=True)
+    
     # --- Final Cleanup ---
     if writer and rank == 0: writer.close()
     if is_ddp: cleanup()
