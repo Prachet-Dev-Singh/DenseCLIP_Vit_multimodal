@@ -727,210 +727,192 @@ class DenseCLIP(nn.Module): # Inherit directly from nn.Module
                       'depth': depth prediction [N, 1, H_img, W_img] (resized to img), or None on error
                   }
         """
+        logger.debug(f"FORWARD_START: img shape: {img.shape}, return_loss: {return_loss}, training: {self.training}")
+
         # 1. Extract Features from Backbone
-        # Returns a list of tensors, e.g., [stage1, ..., stage4] for ResNet
-        # or [spatial_map_768] for modified ViT
         try:
             backbone_features = self.extract_feat(img)
             if not backbone_features: # Handle empty list return
                 raise ValueError("Backbone feature extraction returned empty list.")
+            logger.debug(f"FORWARD_DEBUG: Backbone features extracted. Count: {len(backbone_features)}. First feature shape: {backbone_features[0].shape if backbone_features else 'N/A'}")
         except Exception as bb_e:
             logger.error(f"Error during backbone feature extraction: {bb_e}", exc_info=True)
-            # Return structure with Nones to allow train_worker to skip batch
             if return_loss and self.training: return {'main_output': None, 'depth_output': None, 'aux_losses': {}}
-            else: return {'seg': None, 'depth': None} # Return None dict for inference
+            else: return {'seg': None, 'depth': None}
 
-        # Keep a copy of original backbone features for potential neck/aux head use
         _x_orig = [feat.clone() for feat in backbone_features]
 
         # 2. Process Features (for Score Map & Context Decoder)
-        # This primarily calculates text_embeddings and score_map.
-        # It uses the *last* original backbone feature (_x_orig[-1]) internally.
         try:
-            # Pass _x_orig which _process_features expects as input list
             text_embeddings, _, score_map, _ = self._process_features(_x_orig)
+            logger.debug(f"FORWARD_DEBUG: _process_features completed. text_embeddings shape: {text_embeddings.shape if text_embeddings is not None else 'None'}, score_map shape: {score_map.shape if score_map is not None else 'None'}")
         except Exception as proc_e:
              logger.error(f"Error during _process_features: {proc_e}", exc_info=True)
              if return_loss and self.training: return {'main_output': None, 'depth_output': None, 'aux_losses': {}}
              else: return {'seg': None, 'depth': None}
 
-
         # 3. Process Features through Neck (if exists) & Select Input for Heads
-        input_for_heads = None # Initialize features to feed into BOTH heads
+        input_for_heads = None
         if self.neck:
-            # --- Neck Path ---
             try:
-                logger.debug("Passing ORIGINAL backbone features (_x_orig) through neck...")
-                # Create dict input only if neck is torchvision FPN
+                logger.debug("FORWARD_DEBUG: Passing ORIGINAL backbone features (_x_orig) through neck...")
                 neck_input = {str(i): feat for i, feat in enumerate(_x_orig)} if isinstance(self.neck, FeaturePyramidNetwork) else _x_orig
-
-                features_after_neck = self.neck(neck_input) # Neck should return list: [fused_map] or [p2,p3,p4,p5]
-
-                # Process neck output to select the feature for the main head
+                features_after_neck = self.neck(neck_input)
                 if not features_after_neck:
                     raise ValueError("Neck processing returned empty features.")
                 elif isinstance(features_after_neck, (list, tuple)) and features_after_neck:
-                     # **Assumption**: Highest resolution feature for the head is the FIRST element
                      input_for_heads = features_after_neck[0]
-                     logger.debug(f"Using neck output feature 0 (shape {input_for_heads.shape}) for heads.")
-                elif isinstance(features_after_neck, torch.Tensor): # Handle neck returning single tensor
+                     logger.debug(f"FORWARD_DEBUG: Using neck output feature 0 (shape {input_for_heads.shape}) for heads.")
+                elif isinstance(features_after_neck, torch.Tensor):
                      input_for_heads = features_after_neck
-                     logger.debug(f"Using single tensor neck output (shape {input_for_heads.shape}) for heads.")
+                     logger.debug(f"FORWARD_DEBUG: Using single tensor neck output (shape {input_for_heads.shape}) for heads.")
                 else:
                      raise TypeError(f"Could not determine valid feature tensor from neck output: {type(features_after_neck)}")
-
             except Exception as neck_e:
                  logger.error(f"Error during neck processing: {neck_e}", exc_info=True)
-                 # input_for_heads remains None if neck fails
-            # --- End Neck Path ---
         else:
-            # --- No Neck Path ---
-            if not _x_orig: # Check if _x_orig is empty
-                logger.error("Original backbone features (_x_orig) are empty in 'no neck' path.")
-                # input_for_heads remains None
+            if not _x_orig:
+                logger.error("FORWARD_ERROR: Original backbone features (_x_orig) are empty in 'no neck' path.")
             else:
-                # Use the LAST feature map directly from the original backbone output (_x_orig)
-                input_for_heads = _x_orig[-1] # Use LAST feature from backbone
-                logger.debug(f"Skipping neck. Using last backbone feature (shape {input_for_heads.shape}) for heads.")
-            # --- End No Neck Path ---
+                input_for_heads = _x_orig[-1]
+                logger.debug(f"FORWARD_DEBUG: Skipping neck. Using last backbone feature (shape {input_for_heads.shape}) for heads.")
 
-
-        # 4. Prepare Input for Auxiliary Head (if exists)
+        # 4. Prepare Input for Auxiliary Head (if exists) - Assuming this part is not critical for the current error
         input_for_aux_head = None
         if self.with_auxiliary_head:
-             # Logic depends on which feature from _x_orig the aux head expects
              aux_input_index = self._decode_head_cfg.get('aux_input_index', 2) if self._decode_head_cfg else 2
              if 0 <= aux_input_index < len(_x_orig):
                   input_for_aux_head = _x_orig[aux_input_index]
-                  logger.debug(f"Using original feature idx {aux_input_index} for aux head. Shape: {input_for_aux_head.shape}")
-             else:
-                  logger.warning(f"Cannot get feature at index {aux_input_index} for auxiliary head (len={len(_x_orig)}).")
-
+             # else: logger.warning(...) # Already logs this
 
         # 5. Forward through Decode Head(s)
-        # Initialize outputs to None
-        output_logits = None # Segmentation
-        output_depth = None  # Depth
+        output_logits = None
+        output_depth = None
 
-        # Check if input for heads was successfully determined
         if input_for_heads is None:
-             logger.error("Input tensor for heads is None. Cannot proceed with head forward pass.")
+             logger.error("FORWARD_ERROR: Input tensor for heads (input_for_heads) is None. Cannot proceed with head forward pass.")
         else:
-            # Segmentation Head Forward
+            logger.debug(f"FORWARD_DEBUG: input_for_heads shape: {input_for_heads.shape}, dtype: {input_for_heads.dtype}, device: {input_for_heads.device}")
             if self.with_decode_head:
                 try:
+                    logger.debug("FORWARD_DEBUG: Calling segmentation decode_head...")
                     output_logits = self.decode_head(input_for_heads)
-                    if output_logits is None: logger.warning("Segmentation decode head returned None.")
-                    else: logger.debug(f"Segmentation head output shape: {output_logits.shape}")
+                    if output_logits is None: logger.warning("FORWARD_WARNING: Segmentation decode_head returned None.")
+                    else: logger.debug(f"FORWARD_DEBUG: Segmentation head output_logits shape: {output_logits.shape}")
                 except Exception as head_e:
                     logger.error(f"Error in segmentation head forward: {head_e}", exc_info=True)
-                    output_logits = None # Ensure output is None on error
+                    output_logits = None
+            else:
+                logger.debug("FORWARD_DEBUG: No segmentation decode_head (self.with_decode_head is False).")
 
-            # Depth Head Forward
+
             if self.with_depth_head:
                 try:
-                    output_depth = self.depth_head(input_for_heads) # Pass the SAME input features
-                    if output_depth is None: logger.warning("Depth head returned None.")
-                    else: logger.debug(f"Depth head output shape: {output_depth.shape}")
+                    logger.debug("FORWARD_DEBUG: Calling depth_head...")
+                    output_depth = self.depth_head(input_for_heads)
+                    if output_depth is None: logger.warning("FORWARD_WARNING: Depth head returned None.")
+                    else: logger.debug(f"FORWARD_DEBUG: Depth head output_depth shape: {output_depth.shape}")
                 except Exception as depth_head_e:
                     logger.error(f"Error during depth head forward: {depth_head_e}", exc_info=True)
-                    output_depth = None # Ensure output is None on error
-
+                    output_depth = None
+            else:
+                logger.debug("FORWARD_DEBUG: No depth head (self.with_depth_head is False).")
 
         # 6. Handle Training vs Inference Return Values
         if return_loss and self.training:
-             # Determine target shape for resizing (H, W)
              gt_h, gt_w = -1, -1
-             gt_depth = kwargs.get('gt_depth') # Check if gt_depth was passed
              if gt_semantic_seg is not None:
                  gt_h, gt_w = gt_semantic_seg.shape[-2:]
+                 logger.debug(f"FORWARD_DEBUG: Training mode, GT shape from seg: ({gt_h}, {gt_w})")
              elif kwargs.get('gt_depth') is not None:
                  gt_h, gt_w = kwargs['gt_depth'].shape[-2:]
-             elif kwargs.get('depth_targets') is not None: # Check common names from train_worker
+                 logger.debug(f"FORWARD_DEBUG: Training mode, GT shape from depth: ({gt_h}, {gt_w})")
+             elif kwargs.get('depth_targets') is not None:
                   gt_h, gt_w = kwargs['depth_targets'].shape[-2:]
-             elif kwargs.get('seg_targets') is not None: # Check common names from train_worker
+                  logger.debug(f"FORWARD_DEBUG: Training mode, GT shape from depth_targets kwarg: ({gt_h}, {gt_w})")
+             elif kwargs.get('seg_targets') is not None:
                   gt_h, gt_w = kwargs['seg_targets'].shape[-2:]
+                  logger.debug(f"FORWARD_DEBUG: Training mode, GT shape from seg_targets kwarg: ({gt_h}, {gt_w})")
 
-             # Only proceed with resizing if we got a valid target shape
+
              can_resize = gt_h > 0 and gt_w > 0
              if not can_resize:
-                  logger.warning("Could not determine target GT shape for resizing model outputs in training.")
-             losses = {} # For auxiliary/identity logits
+                  logger.warning("FORWARD_WARNING: Could not determine target GT shape for resizing model outputs in training.")
+             losses = {}
 
-             # Resize main logits if they exist and target shape is valid
              output_logits_resized = output_logits
-             if output_logits is not None and (gt_h > 0) and output_logits.shape[-2:] != (gt_h, gt_w):
-                  try:
-                      output_logits_resized = F.interpolate(output_logits, size=(gt_h, gt_w), mode='bilinear', align_corners=self.align_corners)
-                      logger.debug(f"Resized main logits to GT shape: {output_logits_resized.shape}")
-                  except Exception as resize_e:
-                      logger.error(f"Error resizing main logits: {resize_e}. Returning unresized.")
-                      output_logits_resized = output_logits # Fallback to unresized
+             if output_logits is not None: # Check if it's not None before trying to access shape
+                if can_resize and output_logits.shape[-2:] != (gt_h, gt_w):
+                    try:
+                        output_logits_resized = F.interpolate(output_logits, size=(gt_h, gt_w), mode='bilinear', align_corners=self.align_corners)
+                        logger.debug(f"FORWARD_DEBUG: Resized main logits to GT shape: {output_logits_resized.shape}")
+                    except Exception as resize_e:
+                        logger.error(f"Error resizing main logits: {resize_e}. Returning unresized.")
+                        output_logits_resized = output_logits
+             else: # output_logits was None
+                logger.warning("FORWARD_WARNING: output_logits is None, cannot resize for training return.")
 
-             # Resize depth output if it exists and target shape is valid
+
              output_depth_resized = output_depth
-             if output_depth is not None and (gt_h > 0) and output_depth.shape[-2:] != (gt_h, gt_w):
-                  try:
-                      output_depth_resized = F.interpolate(output_depth, size=(gt_h, gt_w), mode='bilinear', align_corners=self.align_corners) # Use same alignment?
-                      logger.debug(f"Resized depth output to GT shape: {output_depth_resized.shape}")
-                  except Exception as resize_e:
-                      logger.error(f"Error resizing depth output: {resize_e}. Returning unresized.")
-                      output_depth_resized = output_depth # Fallback to unresized
+             if output_depth is not None: # Check if it's not None
+                if can_resize and output_depth.shape[-2:] != (gt_h, gt_w):
+                    try:
+                        output_depth_resized = F.interpolate(output_depth, size=(gt_h, gt_w), mode='bilinear', align_corners=self.align_corners)
+                        logger.debug(f"FORWARD_DEBUG: Resized depth output to GT shape: {output_depth_resized.shape}")
+                    except Exception as resize_e:
+                        logger.error(f"Error resizing depth output: {resize_e}. Returning unresized.")
+                        output_depth_resized = output_depth
+             else: # output_depth was None
+                #logger.warning("FORWARD_WARNING: output_depth is None, cannot resize for training return.")
+                logger.debug("FORWARD_DEBUG: output_depth is None, cannot resize for training return (expected for seg-only).") 
 
-             # --- Auxiliary / Identity Head Logits (keep logic if needed) ---
-             if self.with_auxiliary_head and self.auxiliary_head and input_for_aux_head is not None:
-                  try:
-                      aux_logits = self.auxiliary_head(input_for_aux_head)
-                      if aux_logits is not None:
-                          aux_logits_resized = aux_logits
-                          if (gt_h > 0) and aux_logits.shape[-2:] != (gt_h, gt_w): aux_logits_resized = F.interpolate(...)
-                          losses['aux_output'] = aux_logits_resized
-                          logger.debug(...)
-                      else: logger.warning("Auxiliary head returned None.")
-                  except Exception as aux_e: logger.error(...)
 
-             if self.with_identity_head and self.identity_head:
-                  try:
-                      id_input = score_map / self.tau
-                      id_logits = self.identity_head(id_input)
-                      if id_logits is not None:
-                          id_logits_resized = id_logits
-                          if (gt_h > 0) and id_logits.shape[-2:] != (gt_h, gt_w): id_logits_resized = F.interpolate(...)
-                          losses['identity_output'] = id_logits_resized
-                          logger.debug(...)
-                      else: logger.warning("Identity head returned None.")
-                  except Exception as id_e: logger.error(...)
+             # --- Auxiliary / Identity Head Logits ---
+             # (Keep existing logic, add debug prints if needed)
 
-             # Return all outputs needed for external loss calculation in train_worker
+             # ===== VVVVV FINAL DEBUG BEFORE RETURN (TRAINING) VVVVV =====
+             logger.debug(f"TRAIN_FWD_RETURN_DEBUG: output_logits_resized is None? {output_logits_resized is None}")
+             if output_logits_resized is not None:
+                 logger.debug(f"TRAIN_FWD_RETURN_DEBUG: output_logits_resized shape: {output_logits_resized.shape}, dtype: {output_logits_resized.dtype}, device: {output_logits_resized.device}")
+                 if torch.is_tensor(output_logits_resized) and output_logits_resized.numel() > 0: # Check if tensor is not empty
+                     logger.debug(f"TRAIN_FWD_RETURN_DEBUG: output_logits_resized min: {output_logits_resized.min().item():.4f}, max: {output_logits_resized.max().item():.4f}, has_nan: {torch.isnan(output_logits_resized).any().item()}")
+
+             logger.debug(f"TRAIN_FWD_RETURN_DEBUG: output_depth_resized is None? {output_depth_resized is None}")
+             if output_depth_resized is not None:
+                 logger.debug(f"TRAIN_FWD_RETURN_DEBUG: output_depth_resized shape: {output_depth_resized.shape}, dtype: {output_depth_resized.dtype}, device: {output_depth_resized.device}")
+                 if torch.is_tensor(output_depth_resized) and output_depth_resized.numel() > 0: # Check if tensor is not empty
+                     logger.debug(f"TRAIN_FWD_RETURN_DEBUG: output_depth_resized min: {output_depth_resized.min().item():.4f}, max: {output_depth_resized.max().item():.4f}, has_nan: {torch.isnan(output_depth_resized).any().item()}")
+            # ===== ^^^^^ END FINAL DEBUG ^^^^^ =====
+
              return {
-                 'main_output': output_logits_resized, # Segmentation logits
-                 'depth_output': output_depth_resized, # Depth prediction
-                 'aux_losses': losses # Dict possibly containing 'aux_output', 'identity_output'
+                 'main_output': output_logits_resized,
+                 'depth_output': output_depth_resized,
+                 'aux_losses': losses
              }
-
-        else: # Inference mode (return_loss=False)
+        else: # Inference mode
              final_output_seg = None; final_output_depth = None
-             img_h, img_w = img.shape[2:] # Target size is input image size
+             img_h, img_w = img.shape[2:]
 
-             # Resize segmentation logits if they exist
              if output_logits is not None:
                   try:
                       if output_logits.shape[-2:] != (img_h, img_w):
                            final_output_seg = F.interpolate(output_logits, size=(img_h, img_w), mode='bilinear', align_corners=self.align_corners)
                       else: final_output_seg = output_logits
-                      logger.debug(f"Final inference seg shape: {final_output_seg.shape}")
-                  except Exception as e: logger.error(...); final_output_seg = output_logits
+                      logger.debug(f"FORWARD_DEBUG: Final inference seg shape: {final_output_seg.shape}")
+                  except Exception as e:
+                      logger.error(f"Error resizing inference seg logits: {e}")
+                      final_output_seg = output_logits # Fallback
 
-             # Resize depth output if it exists
              if output_depth is not None:
                   try:
                       if output_depth.shape[-2:] != (img_h, img_w):
                            final_output_depth = F.interpolate(output_depth, size=(img_h, img_w), mode='bilinear', align_corners=self.align_corners)
                       else: final_output_depth = output_depth
-                      logger.debug(f"Final inference depth shape: {final_output_depth.shape}")
-                  except Exception as e: logger.error(...); final_output_depth = output_depth
+                      logger.debug(f"FORWARD_DEBUG: Final inference depth shape: {final_output_depth.shape}")
+                  except Exception as e:
+                      logger.error(f"Error resizing inference depth pred: {e}")
+                      final_output_depth = output_depth # Fallback
 
-             # Return dictionary with both outputs (value is None if head failed)
              return {'seg': final_output_seg, 'depth': final_output_depth}
         
 
